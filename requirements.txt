@@ -6,3 +6,5 @@ openpyxl
 google-api-python-client
 google-auth-oauthlib
 python-docx
+python-dotenv
+requests

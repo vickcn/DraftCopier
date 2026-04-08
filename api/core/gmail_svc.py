@@ -2,6 +2,11 @@ import base64
 import json
 import os
 import secrets
+import mimetypes
+from email import encoders
+from email.header import Header
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional, Protocol, Sequence
@@ -168,6 +173,7 @@ def create_draft(
         to: str,
         subject: str,
         body_html: str,
+        attachments: Optional[Sequence[dict[str, str | bytes]]] = None,
     ) -> dict:
     """
     Create a Gmail draft using HTML body content.
@@ -181,9 +187,34 @@ def create_draft(
     Returns:
         Gmail API response payload for the created draft.
     """
-    message = MIMEText(body_html, "html", "utf-8")
-    message["to"] = to
-    message["subject"] = subject
+    if attachments:
+        message = MIMEMultipart()
+        message["to"] = to
+        message["subject"] = subject
+        message.attach(MIMEText(body_html, "html", "utf-8"))
+
+        for attachment in attachments:
+            filename = str(attachment.get("filename", "attachment"))
+            content = attachment.get("content", b"")
+            if isinstance(content, str):
+                content = content.encode("utf-8")
+            mime_type = str(attachment.get("mime_type", "")) or mimetypes.guess_type(filename)[0]
+            if not mime_type:
+                mime_type = "application/octet-stream"
+            maintype, subtype = mime_type.split("/", 1)
+            part = MIMEBase(maintype, subtype)
+            part.set_payload(content)
+            encoders.encode_base64(part)
+            part.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=str(Header(filename, "utf-8")),
+            )
+            message.attach(part)
+    else:
+        message = MIMEText(body_html, "html", "utf-8")
+        message["to"] = to
+        message["subject"] = subject
 
     encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
     body = {"message": {"raw": encoded_message}}
@@ -200,5 +231,14 @@ __all__ = [
     "exchange_code_for_token",
     "get_auth_url",
     "load_user_credentials",
+    "revoke_user_credentials",
     "token_store",
 ]
+
+
+def revoke_user_credentials(user_key: str) -> None:
+    """
+    Delete stored credentials for a user. Frontend should also提醒使用者到
+    Google 帳號的「第三方存取」頁面撤銷存取權。
+    """
+    token_store.delete(user_key)

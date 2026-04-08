@@ -5,7 +5,36 @@ from html import escape
 
 from docx import Document
 
-def convert_docx_to_html(file_bytes: bytes, log_colors: bool = False, log_fonts: bool = False) -> str:
+GMAIL_FONT_STACKS = {
+    "Sans Serif": "Arial, Helvetica, sans-serif",
+    "Serif": "'Times New Roman', Times, serif",
+    "等寬字型": "'Courier New', Courier, monospace",
+    "微軟正黑體": "'Microsoft JhengHei', 'PingFang TC', 'Noto Sans TC', sans-serif",
+    "新細明體": "'PMingLiU', 'MingLiU', 'Noto Serif TC', serif",
+    "細明體": "'MingLiU', 'PMingLiU', 'Noto Serif TC', serif",
+    "寬": "'Arial Black', 'Impact', sans-serif",
+    "窄": "'Arial Narrow', 'Helvetica Neue Condensed', sans-serif",
+    "Comic Sans MS": "'Comic Sans MS', 'Comic Sans', cursive",
+    "Garamond": "Garamond, 'Times New Roman', serif",
+    "Georgia": "Georgia, 'Times New Roman', serif",
+    "Tahoma": "Tahoma, 'Segoe UI', sans-serif",
+    "Trebuchet MS": "'Trebuchet MS', 'Segoe UI', sans-serif",
+    "Verdana": "Verdana, 'Segoe UI', sans-serif",
+}
+
+
+def resolve_gmail_font(font_key: str | None) -> str:
+    if not font_key:
+        return GMAIL_FONT_STACKS["Sans Serif"]
+    key = font_key.strip()
+    return GMAIL_FONT_STACKS.get(key, GMAIL_FONT_STACKS["Sans Serif"])
+
+def convert_docx_to_html(
+    file_bytes: bytes,
+    log_colors: bool = False,
+    log_fonts: bool = False,
+    base_font_family: str | None = None,
+) -> str:
     """
     將 .docx 轉為適合 Email 的 HTML 格式，保留常見的行內樣式（粗體、斜體、底線、文字顏色）
     以及無序/有序清單。
@@ -137,9 +166,9 @@ def convert_docx_to_html(file_bytes: bytes, log_colors: bool = False, log_fonts:
     if in_list and current_list_tag:
         html_parts.append(f"</{current_list_tag}>")
 
+    font_family = base_font_family or resolve_gmail_font(None)
     wrapped_html = (
-        "<div style=\"font-family: 'Microsoft JhengHei', sans-serif; "
-        "line-height: 1.6; color: #333;\">"
+        f"<div style=\"font-family: {font_family}; line-height: 1.6; color: #333;\">"
         + "".join(html_parts)
         + "</div>"
     )
@@ -150,11 +179,14 @@ def inject_variables(html_template: str, row_data: Dict[str, Any]) -> str:
     將 HTML 模板中的 {{變數}} 替換為 Excel 的資料內容
     支援自定義欄位，只要 Excel 表頭名稱與 {{}} 內一致即可。
     """
+    # 允許數字欄位（例如 {{1}}）也能對應到 Excel 的欄位名稱
+    normalized_row = {str(k).strip(): v for k, v in row_data.items()}
+
     # 使用正則表達式尋找 {{Key}} 並從 row_data 抓取對應的 Value
     def replace_match(match):
         key = match.group(1).strip()
         # 若 Excel 沒這欄位，則保持原樣或回傳空字串
-        return str(row_data.get(key, match.group(0)))
+        return str(normalized_row.get(key, match.group(0)))
 
     # 匹配 {{ variable_name }} 格式
     pattern = r"\{\{\s*(.*?)\s*\}\}"

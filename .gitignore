@@ -174,6 +174,7 @@ models
 *.sh
 *.bat
 *.zsh
+*.iss
 
 # 資料庫檔案
 *.db
@@ -208,3 +209,11 @@ report_20250902*
 *tmp*
 
 !requirements.txt
+# Next.js & Node
+node_modules/
+.next/
+out/
+build/
+
+# Secrets
+.secrets/
