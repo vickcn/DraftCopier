@@ -28,6 +28,9 @@ if not SESSION_SECRET:
     # 給予一個暫時的預設值，讓 API 至少能啟動以便記錄日誌
     SESSION_SECRET = "fallback_secret_please_set_this_in_vercel"
 
+print(f"[BOOT] Environment: {'Vercel' if os.getenv('VERCEL') == '1' else 'Local'}")
+print(f"[BOOT] CORS Origins: {os.environ.get('CORS_ORIGINS', 'Default')}")
+
 app = FastAPI()
 cors_origins = [
     origin.strip()

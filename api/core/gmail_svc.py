@@ -16,8 +16,12 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
-DEFAULT_SCOPES = ["https://www.googleapis.com/auth/gmail.compose"]
-TOKEN_DIR = Path(os.getenv("GMAIL_TOKEN_DIR", ".secrets/gmail_tokens"))
+# Detact Vercel environment for writable /tmp directory
+IS_VERCEL = os.getenv("VERCEL") == "1"
+if IS_VERCEL:
+    TOKEN_DIR = Path("/tmp/gmail_tokens")
+else:
+    TOKEN_DIR = Path(os.getenv("GMAIL_TOKEN_DIR", ".secrets/gmail_tokens"))
 
 
 class TokenStore(Protocol):
@@ -41,11 +45,13 @@ class FileTokenStore:
 
     def __init__(self, root: Path | str = TOKEN_DIR):
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
         try:
-            os.chmod(self.root, 0o700)
-        except OSError:
-            pass
+            self.root.mkdir(parents=True, exist_ok=True)
+            # Only attempt chmod if not in serverless/readonly environments where it might fail
+            if not IS_VERCEL:
+                os.chmod(self.root, 0o700)
+        except Exception as e:
+            print(f"[!] Warning: Failed to prepare token directory {self.root}: {e}")
 
     def _path(self, user_key: str) -> Path:
         safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in user_key)
