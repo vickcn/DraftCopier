@@ -21,7 +21,7 @@ type DroppedFiles = {
   xlsx?: File;
 };
 
-const apiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:6311";
+const apiBase = process.env.NEXT_PUBLIC_API_BASE || "";
 const fontOptions = [
   { label: "Sans Serif", value: "Sans Serif" },
   { label: "Serif", value: "Serif" },

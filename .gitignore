@@ -175,6 +175,8 @@ models
 *.bat
 *.zsh
 *.iss
+*.mov
+*.mp4
 
 # 資料庫檔案
 *.db
@@ -217,3 +219,4 @@ build/
 
 # Secrets
 .secrets/
+.vercel

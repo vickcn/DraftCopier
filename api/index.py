@@ -24,7 +24,9 @@ load_dotenv()
 port = int(os.environ.get("PORT", 6311))
 SESSION_SECRET = os.environ.get("SESSION_SECRET")
 if not SESSION_SECRET:
-    raise RuntimeError("Missing required environment variable: SESSION_SECRET")
+    print("[CRITICAL] Missing environment variable: SESSION_SECRET")
+    # 給予一個暫時的預設值，讓 API 至少能啟動以便記錄日誌
+    SESSION_SECRET = "fallback_secret_please_set_this_in_vercel"
 
 app = FastAPI()
 cors_origins = [
