@@ -165,7 +165,7 @@ export default function Home() {
     formData.append("docx_file", docxFile);
     formData.append("xlsx_file", xlsxFile);
 
-    const url = new URL(`${apiBase}/api/process`);
+    const url = new URL(`${apiBase}/api/process`, window.location.origin);
     url.searchParams.set("font", selectedFont);
     const xhr = new XMLHttpRequest();
     xhr.open("POST", url.toString());
@@ -268,7 +268,7 @@ export default function Home() {
       formData.append("docx_file", docxFile);
       formData.append("xlsx_file", xlsxFile);
 
-      const url = new URL(`${apiBase}/api/drafts/batch`);
+      const url = new URL(`${apiBase}/api/drafts/batch`, window.location.origin);
       url.searchParams.set("font", selectedFont);
       if (attachmentsDir.trim()) {
         url.searchParams.set("attachments_dir", attachmentsDir.trim());
