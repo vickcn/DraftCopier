@@ -218,6 +218,10 @@ def _require_session_user_key(request: Request) -> str:
 def google_auth(request: Request):
     try:
         user_key = _require_session_user_key(request)
+        print(f"[auth/google] user_key={user_key!r}")
+        print(f"[auth/google] GOOGLE_CLIENT_ID set: {bool(os.environ.get('GOOGLE_CLIENT_ID'))}")
+        print(f"[auth/google] GOOGLE_CLIENT_SECRET set: {bool(os.environ.get('GOOGLE_CLIENT_SECRET'))}")
+        print(f"[auth/google] GOOGLE_REDIRECT_URI={os.environ.get('GOOGLE_REDIRECT_URI')!r}")
         auth_url, state = get_auth_url()
         request.session["oauth_state"] = state
         request.session["oauth_user_key"] = user_key
@@ -225,6 +229,7 @@ def google_auth(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/auth/callback/google")
