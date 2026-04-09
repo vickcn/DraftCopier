@@ -222,9 +222,11 @@ def google_auth(request: Request):
         print(f"[auth/google] GOOGLE_CLIENT_ID set: {bool(os.environ.get('GOOGLE_CLIENT_ID'))}")
         print(f"[auth/google] GOOGLE_CLIENT_SECRET set: {bool(os.environ.get('GOOGLE_CLIENT_SECRET'))}")
         print(f"[auth/google] GOOGLE_REDIRECT_URI={os.environ.get('GOOGLE_REDIRECT_URI')!r}")
-        auth_url, state = get_auth_url()
+        auth_url, state, code_verifier = get_auth_url()
         request.session["oauth_state"] = state
         request.session["oauth_user_key"] = user_key
+        if code_verifier:
+            request.session["oauth_code_verifier"] = code_verifier
         return {"auth_url": auth_url}
     except HTTPException:
         raise
@@ -243,9 +245,14 @@ def google_auth_callback(request: Request, code: str, state: str):
         user_key = request.session.get("oauth_user_key")
         if not user_key:
             raise HTTPException(status_code=401, detail="Missing session user_key")
-        creds = exchange_code_for_token(code=code, state=state, user_key=user_key)
+            
+        code_verifier = request.session.get("oauth_code_verifier")
+        
+        creds = exchange_code_for_token(code=code, state=state, user_key=user_key, code_verifier=code_verifier)
+        
         request.session.pop("oauth_state", None)
         request.session.pop("oauth_user_key", None)
+        request.session.pop("oauth_code_verifier", None)
         front_base = os.environ.get("FRONTEND_BASE_URL", "http://localhost:6406")
         redirect_url = f"{front_base}/?auth=success"
         return RedirectResponse(url=redirect_url, status_code=302)

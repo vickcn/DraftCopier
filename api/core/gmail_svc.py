@@ -109,7 +109,7 @@ def _scopes(scopes: Optional[Sequence[str]] = None) -> list[str]:
 def get_auth_url(
         state: Optional[str] = None,
         scopes: Optional[Sequence[str]] = None,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str | None]:
     """
     Generate the Google OAuth2 authorization URL.
 
@@ -134,7 +134,8 @@ def get_auth_url(
         include_granted_scopes="true",
         prompt="consent",
     )
-    return auth_url, resolved_state
+    code_verifier = getattr(flow, 'code_verifier', None)
+    return auth_url, resolved_state, code_verifier
 
 
 def exchange_code_for_token(
@@ -143,6 +144,7 @@ def exchange_code_for_token(
         user_key: str,
         state: Optional[str] = None,
         scopes: Optional[Sequence[str]] = None,
+        code_verifier: Optional[str] = None,
     ) -> Credentials:
     """
     Exchange an OAuth2 code for credentials and save them server-side.
@@ -154,7 +156,13 @@ def exchange_code_for_token(
         state=state,
     )
     flow.redirect_uri = redirect_uri
-    flow.fetch_token(code=code)
+    if code_verifier:
+        try:
+            flow.fetch_token(code=code, code_verifier=code_verifier)
+        except TypeError:
+            flow.fetch_token(code=code)
+    else:
+        flow.fetch_token(code=code)
 
     creds = flow.credentials
     token_store.save(user_key, creds)
