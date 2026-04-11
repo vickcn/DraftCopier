@@ -355,6 +355,30 @@ body {
   font-size: 0.9rem;
 }
 
+.failed-items {
+  margin-top: 12px;
+  border: 1px solid rgba(255, 107, 107, 0.35);
+  background: rgba(255, 107, 107, 0.08);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.failed-title {
+  margin: 0 0 8px;
+  color: #ff9f9f;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.failed-list {
+  margin: 0;
+  padding-left: 18px;
+  color: #ffc2c2;
+  font-size: 0.86rem;
+  display: grid;
+  gap: 6px;
+}
+
 .preview {
   display: grid;
   gap: 18px;

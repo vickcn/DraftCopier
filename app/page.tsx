@@ -30,6 +30,21 @@ type CachedUpload = {
   cacheId: string;
   docxName: string;
   xlsxName: string;
+  font?: string;
+};
+
+type BatchFailedItem = {
+  row?: number;
+  field?: string;
+  name?: string;
+  message?: string;
+};
+
+type BatchSaveResponse = {
+  status?: "ok" | "partial" | "failed";
+  draft_count?: number;
+  draft_ids?: string[];
+  failed_items?: BatchFailedItem[];
 };
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "";
@@ -114,6 +129,7 @@ export default function Home() {
   const [selectedFont, setSelectedFont] = useState(fontOptions[0].value);
   const [draftStatus, setDraftStatus] = useState<"idle" | "saving" | "done" | "error">("idle");
   const [draftMessage, setDraftMessage] = useState<string | null>(null);
+  const [draftFailedItems, setDraftFailedItems] = useState<BatchFailedItem[]>([]);
   const [attachmentsDir, setAttachmentsDir] = useState("");
 
   const statusLabel: Record<UploadState, string> = {
@@ -125,6 +141,7 @@ export default function Home() {
 
   const docxInputRef = useRef<HTMLInputElement>(null);
   const xlsxInputRef = useRef<HTMLInputElement>(null);
+  const restoreAttemptedRef = useRef<string | null>(null);
 
   useEffect(() => {
     const raw = localStorage.getItem(uploadCacheKey);
@@ -133,11 +150,52 @@ export default function Home() {
       const parsed = JSON.parse(raw) as CachedUpload;
       if (parsed?.cacheId && parsed?.docxName && parsed?.xlsxName) {
         setCachedUpload(parsed);
+        if (parsed.font) {
+          setSelectedFont(parsed.font);
+        }
       }
     } catch {
       localStorage.removeItem(uploadCacheKey);
     }
   }, []);
+
+  useEffect(() => {
+    const restorePreview = async () => {
+      if (!cachedUpload) return;
+      if (preview) return;
+      if (restoreAttemptedRef.current === cachedUpload.cacheId) return;
+      restoreAttemptedRef.current = cachedUpload.cacheId;
+      try {
+        setStatus("uploading");
+        setProgress(15);
+        const url = new URL(`${apiBase}/api/process/cache`, window.location.origin);
+        url.searchParams.set("cache_id", cachedUpload.cacheId);
+        url.searchParams.set("font", cachedUpload.font || selectedFont);
+        const response = await fetch(url.toString(), {
+          method: "GET",
+          credentials: "include",
+        });
+        if (!response.ok) {
+          if (response.status === 400) {
+            setCachedUpload(null);
+            localStorage.removeItem(uploadCacheKey);
+            setDraftMessage("快取已失效，請重新上傳檔案。");
+          }
+          setStatus("idle");
+          setProgress(0);
+          return;
+        }
+        const data = (await response.json()) as PreviewPayload;
+        setPreview(data);
+        setStatus("done");
+        setProgress(100);
+      } catch {
+        setStatus("idle");
+        setProgress(0);
+      }
+    };
+    void restorePreview();
+  }, [cachedUpload, preview, selectedFont]);
 
   const emailHeader = useMemo(() => {
     if (!preview?.headers) return null;
@@ -172,6 +230,7 @@ export default function Home() {
     setPreview(null);
     setDraftStatus("idle");
     setDraftMessage(null);
+    setDraftFailedItems([]);
   };
 
   const handleUpload = () => {
@@ -186,6 +245,7 @@ export default function Home() {
     setPreview(null);
     setDraftStatus("idle");
     setDraftMessage(null);
+    setDraftFailedItems([]);
 
     const formData = new FormData();
     formData.append("docx_file", docxFile);
@@ -195,6 +255,7 @@ export default function Home() {
     url.searchParams.set("font", selectedFont);
     const xhr = new XMLHttpRequest();
     xhr.open("POST", url.toString());
+    xhr.withCredentials = true;
 
     xhr.upload.addEventListener("progress", (event) => {
       if (event.lengthComputable) {
@@ -213,9 +274,11 @@ export default function Home() {
               cacheId: data.cache_id,
               docxName: data.cached_files.docx_name,
               xlsxName: data.cached_files.xlsx_name,
+              font: selectedFont,
             };
             setCachedUpload(nextCached);
             localStorage.setItem(uploadCacheKey, JSON.stringify(nextCached));
+            restoreAttemptedRef.current = data.cache_id;
           }
           setStatus("done");
           setProgress(100);
@@ -249,6 +312,7 @@ export default function Home() {
     setAttachmentsDir("");
     setCachedUpload(null);
     localStorage.removeItem(uploadCacheKey);
+    restoreAttemptedRef.current = null;
     if (docxInputRef.current) docxInputRef.current.value = "";
     if (xlsxInputRef.current) xlsxInputRef.current.value = "";
   };
@@ -267,18 +331,21 @@ export default function Home() {
       if (!response.ok) {
         setDraftStatus("error");
         setDraftMessage("取得授權連結失敗。");
+        setDraftFailedItems([]);
         return;
       }
       const data = (await response.json()) as { auth_url?: string };
       if (!data.auth_url) {
         setDraftStatus("error");
         setDraftMessage("授權連結格式錯誤。");
+        setDraftFailedItems([]);
         return;
       }
       window.location.href = data.auth_url;
     } catch (err) {
       setDraftStatus("error");
       setDraftMessage("啟動授權流程失敗，請稍後再試。");
+      setDraftFailedItems([]);
     }
   };
 
@@ -286,15 +353,18 @@ export default function Home() {
     if (!preview && !cachedUpload) {
       setDraftStatus("error");
       setDraftMessage("尚未產生預覽，無法儲存草稿。");
+      setDraftFailedItems([]);
       return;
     }
     if (preview && missingHeaders.length > 0) {
       setDraftStatus("error");
       setDraftMessage("找不到必要欄位（email / subject），請檢查 Excel 標題列。");
+      setDraftFailedItems([]);
       return;
     }
     setDraftStatus("saving");
     setDraftMessage(null);
+    setDraftFailedItems([]);
     try {
       const formData = new FormData();
       if (docxFile && xlsxFile) {
@@ -322,21 +392,38 @@ export default function Home() {
       if (response.status === 401) {
         setDraftStatus("error");
         setDraftMessage("尚未連結 Gmail，請先完成授權。");
+        setDraftFailedItems([]);
         return;
       }
       if (!response.ok) {
         const text = await response.text();
         setDraftStatus("error");
         setDraftMessage(`儲存草稿失敗：${text}`);
+        setDraftFailedItems([]);
         return;
       }
 
-      const data = (await response.json()) as { draft_count?: number };
+      const data = (await response.json()) as BatchSaveResponse;
+      const failedItems = Array.isArray(data.failed_items) ? data.failed_items : [];
+      setDraftFailedItems(failedItems);
+
+      const draftCount = data.draft_count ?? 0;
+      if ((data.status === "failed" || draftCount === 0) && failedItems.length > 0) {
+        setDraftStatus("error");
+        setDraftMessage(`未建立草稿。失敗項目：${failedItems.length}。`);
+        return;
+      }
+
       setDraftStatus("done");
-      setDraftMessage(`已建立 Gmail 草稿：${data.draft_count ?? 0} 封。`);
+      if (failedItems.length > 0) {
+        setDraftMessage(`已建立 Gmail 草稿：${draftCount} 封；失敗項目：${failedItems.length}。`);
+      } else {
+        setDraftMessage(`已建立 Gmail 草稿：${draftCount} 封。`);
+      }
     } catch (err) {
       setDraftStatus("error");
       setDraftMessage("儲存草稿時發生錯誤。");
+      setDraftFailedItems([]);
     }
   };
 
@@ -371,6 +458,11 @@ export default function Home() {
           </div>
 
           <div className="card">
+            <div className="actions">
+              <button className="ghost" onClick={connectGmail}>
+                先連結 Gmail
+              </button>
+            </div>
             <div
               className={`dropzone ${isDragActive ? "active" : ""}`}
               onDragOver={(event) => {
@@ -495,9 +587,6 @@ export default function Home() {
               <button className="primary" onClick={saveDrafts} disabled={draftStatus === "saving"}>
                 {draftStatus === "saving" ? "批次建立中..." : "批次建立 Gmail 草稿"}
               </button>
-              <button className="ghost" onClick={connectGmail}>
-                連結 Gmail
-              </button>
             </div>
 
             <div className="field">
@@ -520,6 +609,20 @@ export default function Home() {
 
             {draftMessage && (
               <p className={draftStatus === "error" ? "error" : "hint"}>{draftMessage}</p>
+            )}
+            {draftFailedItems.length > 0 && (
+              <div className="failed-items">
+                <p className="failed-title">失敗項目</p>
+                <ul className="failed-list">
+                  {draftFailedItems.map((item, index) => (
+                    <li key={`${item.row ?? "na"}-${item.field ?? "na"}-${item.name ?? index}-${index}`}>
+                      第 {item.row ?? "?"} 列 / {item.field ?? "unknown"}
+                      {item.name ? ` / ${item.name}` : ""}
+                      {item.message ? `：${item.message}` : ""}
+                    </li>
+                  ))}
+                </ul>
+              </div>
             )}
           </div>
         </section>

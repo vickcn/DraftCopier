@@ -219,21 +219,30 @@ def _safe_upload_name(name: str, fallback: str) -> str:
     return base or fallback
 
 
-def _cache_root_for_user(user_key: str) -> Path:
-    safe_user = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in user_key)
-    return UPLOAD_CACHE_DIR / safe_user
+def _get_upload_cache_namespace(request: Request) -> str:
+    namespace = request.session.get("upload_cache_ns")
+    if isinstance(namespace, str) and namespace:
+        return namespace
+    namespace = uuid4().hex
+    request.session["upload_cache_ns"] = namespace
+    return namespace
+
+
+def _cache_root_for_namespace(namespace: str) -> Path:
+    safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in namespace)
+    return UPLOAD_CACHE_DIR / safe_name
 
 
 def _write_upload_cache(
     *,
-    user_key: str,
+    namespace: str,
     docx_name: str,
     docx_content: bytes,
     xlsx_name: str,
     xlsx_content: bytes,
 ) -> dict[str, str]:
     cache_id = uuid4().hex
-    cache_root = _cache_root_for_user(user_key)
+    cache_root = _cache_root_for_namespace(namespace)
     cache_dir = cache_root / cache_id
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -246,10 +255,10 @@ def _write_upload_cache(
     return {"cache_id": cache_id, "docx_name": safe_docx_name, "xlsx_name": safe_xlsx_name}
 
 
-def _read_upload_cache(*, user_key: str, cache_id: str) -> dict[str, bytes | str]:
+def _read_upload_cache(*, namespace: str, cache_id: str) -> dict[str, bytes | str]:
     if not cache_id or not re.fullmatch(r"[a-f0-9]{32}", cache_id):
         raise HTTPException(status_code=400, detail={"error": "invalid_cache_id"})
-    cache_dir = _cache_root_for_user(user_key) / cache_id
+    cache_dir = _cache_root_for_namespace(namespace) / cache_id
     docx_path = cache_dir / "template.docx"
     xlsx_path = cache_dir / "recipients.xlsx"
     if not docx_path.exists() or not xlsx_path.exists():
@@ -270,6 +279,62 @@ def _read_upload_cache(*, user_key: str, cache_id: str) -> dict[str, bytes | str
         "docx_content": docx_path.read_bytes(),
         "xlsx_content": xlsx_path.read_bytes(),
     }
+
+
+def _build_preview_payload(
+    *,
+    docx_content: bytes,
+    xlsx_content: bytes,
+    sheet: str | None,
+    font: str | None,
+    cache_info: dict[str, str] | None,
+) -> dict:
+    font_family = resolve_gmail_font(font)
+    html_template = convert_docx_to_html(docx_content, base_font_family=font_family)
+
+    sheet_name: int | str = 0
+    if sheet is not None:
+        sheet = sheet.strip()
+        if sheet:
+            sheet_name = int(sheet) if sheet.isdigit() else sheet
+    df = pd.read_excel(io.BytesIO(xlsx_content), sheet_name=sheet_name)
+
+    rows = df.to_dict(orient="records")
+    attachment_headers = [str(h) for h in _find_attachment_headers(list(df.columns))]
+
+    preview = ""
+    first_row: dict[str, str] = {}
+    if rows:
+        preview = inject_variables(html_template, rows[0])
+        for key, value in rows[0].items():
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                first_row[str(key)] = ""
+            elif isinstance(value, (datetime, date, pd.Timestamp)):
+                first_row[str(key)] = value.isoformat()
+            else:
+                first_row[str(key)] = str(value)
+
+    email_header = _find_header(list(df.columns), EMAIL_FIELD_CANDIDATES)
+    subject_header = _find_header(list(df.columns), SUBJECT_FIELD_CANDIDATES)
+
+    payload = {
+        "total_records": len(rows),
+        "headers": list(df.columns),
+        "preview_first_row": preview,
+        "first_row": first_row,
+        "detected_fields": {
+            "email": email_header,
+            "subject": subject_header,
+            "attachments": attachment_headers,
+        },
+    }
+    if cache_info:
+        payload["cache_id"] = cache_info["cache_id"]
+        payload["cached_files"] = {
+            "docx_name": cache_info["docx_name"],
+            "xlsx_name": cache_info["xlsx_name"],
+        }
+    return payload
 
 
 def get_attachment_content(file_path: str, credentials: Credentials) -> dict[str, str | bytes]:
@@ -405,12 +470,13 @@ async def create_drafts_batch(
     try:
         user_key = _require_session_user_key(request)
         creds = load_user_credentials(user_key)
+        cache_namespace = _get_upload_cache_namespace(request)
 
         if docx_file and xlsx_file:
             docx_content = await docx_file.read()
             xlsx_content = await xlsx_file.read()
         elif cache_id:
-            cached = _read_upload_cache(user_key=user_key, cache_id=cache_id)
+            cached = _read_upload_cache(namespace=cache_namespace, cache_id=cache_id)
             docx_content = cached["docx_content"]
             xlsx_content = cached["xlsx_content"]
             if not isinstance(docx_content, bytes) or not isinstance(xlsx_content, bytes):
@@ -449,7 +515,7 @@ async def create_drafts_batch(
             )
 
         rows = df.to_dict(orient="records")
-        errors = []
+        failed_items: list[dict[str, object]] = []
         attachment_headers_raw = _find_attachment_headers(list(df.columns))
         base_dir = Path(attachments_dir).expanduser().resolve() if attachments_dir else ATTACHMENTS_DIR
         
@@ -458,13 +524,22 @@ async def create_drafts_batch(
         print(f"[DEBUG] 附件根目錄 (base_dir): {base_dir} (存在: {base_dir.exists()})")
         
         row_attachments: list[list[dict[str, str | bytes]]] = []
+        row_can_send: list[bool] = []
+
+        def _is_empty_cell(value: object) -> bool:
+            return value is None or (isinstance(value, float) and pd.isna(value)) or str(value).strip() == ""
+
         for idx, row in enumerate(rows, start=1):
             to_value = row.get(email_header)
             subject_value = row.get(subject_header)
-            if to_value is None or (isinstance(to_value, float) and pd.isna(to_value)) or str(to_value).strip() == "":
-                errors.append({"row": idx, "field": "email"})
-            if subject_value is None or (isinstance(subject_value, float) and pd.isna(subject_value)) or str(subject_value).strip() == "":
-                errors.append({"row": idx, "field": "subject"})
+            can_send = True
+            if _is_empty_cell(to_value):
+                failed_items.append({"row": idx, "field": "email", "message": "Missing recipient email"})
+                can_send = False
+            if _is_empty_cell(subject_value):
+                failed_items.append({"row": idx, "field": "subject", "message": "Missing email subject"})
+                can_send = False
+            row_can_send.append(can_send)
 
             attachments_for_row: list[dict[str, str | bytes]] = []
             for header in attachment_headers_raw:
@@ -496,40 +571,84 @@ async def create_drafts_batch(
                                 )
                         except Exception as e:
                             print(f"[ERROR] 找不到附件檔案: {name} (位於第 {idx} 列) err={e}")
-                            errors.append({"row": idx, "field": "attachment", "name": name})
+                            failed_items.append(
+                                {
+                                    "row": idx,
+                                    "field": "attachment",
+                                    "name": name,
+                                    "message": str(e),
+                                }
+                            )
                             continue
                     attachments_for_row.append(resolved)
             row_attachments.append(attachments_for_row)
 
-        if errors:
-            print(f"[ERROR] 批次建檔失敗，以下資料有缺失：{errors}")
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": "missing_required_values",
-                    "missing": errors,
-                },
-            )
-
         drafts = []
         for idx, row in enumerate(rows, start=1):
+            if not row_can_send[idx - 1]:
+                continue
             to_value = row.get(email_header)
             subject_value = row.get(subject_header)
             body_html = inject_variables(html_template, row)
-            draft = create_draft(
-                creds=creds,
-                to=str(to_value).strip(),
-                subject=str(subject_value).strip(),
-                body_html=body_html,
-                attachments=row_attachments[idx - 1],
-            )
-            drafts.append(draft.get("id"))
+            try:
+                draft = create_draft(
+                    creds=creds,
+                    to=str(to_value).strip(),
+                    subject=str(subject_value).strip(),
+                    body_html=body_html,
+                    attachments=row_attachments[idx - 1],
+                )
+                drafts.append(draft.get("id"))
+            except Exception as e:
+                failed_items.append({"row": idx, "field": "draft", "message": str(e)})
 
-        return {"status": "ok", "draft_count": len(drafts), "draft_ids": drafts}
+        status = "ok" if not failed_items else ("partial" if drafts else "failed")
+        print(
+            f"[BATCH] status={status} drafts={len(drafts)} failed_items={len(failed_items)}"
+        )
+        return {
+            "status": status,
+            "draft_count": len(drafts),
+            "draft_ids": drafts,
+            "failed_items": failed_items,
+        }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/process/cache")
+def process_cached_preview(
+    request: Request,
+    cache_id: str,
+    sheet: str | None = None,
+    font: str | None = None,
+):
+    try:
+        cache_namespace = _get_upload_cache_namespace(request)
+        cached = _read_upload_cache(namespace=cache_namespace, cache_id=cache_id)
+        docx_content = cached["docx_content"]
+        xlsx_content = cached["xlsx_content"]
+        if not isinstance(docx_content, bytes) or not isinstance(xlsx_content, bytes):
+            raise HTTPException(status_code=500, detail={"error": "invalid_cache_payload"})
+        cache_info = {
+            "cache_id": cache_id,
+            "docx_name": str(cached["docx_name"]),
+            "xlsx_name": str(cached["xlsx_name"]),
+        }
+        return _build_preview_payload(
+            docx_content=docx_content,
+            xlsx_content=xlsx_content,
+            sheet=sheet,
+            font=font,
+            cache_info=cache_info,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/api/process")
 async def process_files(
@@ -540,66 +659,27 @@ async def process_files(
     font: str | None = None,
 ):
     try:
-        user_key = request.session.get("user_key") or "guest_user"
+        cache_namespace = _get_upload_cache_namespace(request)
         # 1. 讀取 Word 模板並轉為 HTML
         docx_content = await docx_file.read()
-        font_family = resolve_gmail_font(font)
-        html_template = convert_docx_to_html(docx_content, base_font_family=font_family)
 
         # 2. 使用 Pandas 讀取 Excel 數據
         xlsx_content = await xlsx_file.read()
         cache_info = _write_upload_cache(
-            user_key=user_key,
+            namespace=cache_namespace,
             docx_name=docx_file.filename or "template.docx",
             docx_content=docx_content,
             xlsx_name=xlsx_file.filename or "list.xlsx",
             xlsx_content=xlsx_content,
         )
         request.session["latest_cache_id"] = cache_info["cache_id"]
-        sheet_name: int | str = 0
-        if sheet is not None:
-            sheet = sheet.strip()
-            if sheet:
-                sheet_name = int(sheet) if sheet.isdigit() else sheet
-        df = pd.read_excel(io.BytesIO(xlsx_content), sheet_name=sheet_name)
-        
-        # 將 DataFrame 轉為字典列表，方便處理自定義欄位
-        rows = df.to_dict(orient="records")
-        attachment_headers = [str(h) for h in _find_attachment_headers(list(df.columns))]
-        
-        # 3. 產生第一筆預覽 (作為測試)
-        preview = ""
-        first_row: dict[str, str] = {}
-        if rows:
-            preview = inject_variables(html_template, rows[0])
-            for key, value in rows[0].items():
-                # Normalize to string-safe values for JSON output
-                if value is None or (isinstance(value, float) and pd.isna(value)):
-                    first_row[str(key)] = ""
-                elif isinstance(value, (datetime, date, pd.Timestamp)):
-                    first_row[str(key)] = value.isoformat()
-                else:
-                    first_row[str(key)] = str(value)
-
-        email_header = _find_header(list(df.columns), EMAIL_FIELD_CANDIDATES)
-        subject_header = _find_header(list(df.columns), SUBJECT_FIELD_CANDIDATES)
-
-        return {
-            "total_records": len(rows),
-            "headers": list(df.columns),
-            "preview_first_row": preview,
-            "first_row": first_row,
-            "detected_fields": {
-                "email": email_header,
-                "subject": subject_header,
-                "attachments": attachment_headers,
-            },
-            "cache_id": cache_info["cache_id"],
-            "cached_files": {
-                "docx_name": cache_info["docx_name"],
-                "xlsx_name": cache_info["xlsx_name"],
-            },
-        }
+        return _build_preview_payload(
+            docx_content=docx_content,
+            xlsx_content=xlsx_content,
+            sheet=sheet,
+            font=font,
+            cache_info=cache_info,
+        )
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
