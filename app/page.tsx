@@ -1,12 +1,17 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type PreviewPayload = {
   total_records: number;
   headers: string[];
   preview_first_row: string;
   first_row?: Record<string, string>;
+  cache_id?: string;
+  cached_files?: {
+    docx_name: string;
+    xlsx_name: string;
+  };
   detected_fields?: {
     email: string | null;
     subject: string | null;
@@ -21,7 +26,14 @@ type DroppedFiles = {
   xlsx?: File;
 };
 
+type CachedUpload = {
+  cacheId: string;
+  docxName: string;
+  xlsxName: string;
+};
+
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "";
+const uploadCacheKey = "draftcopier_upload_cache_v1";
 const fontOptions = [
   { label: "Sans Serif", value: "Sans Serif" },
   { label: "Serif", value: "Serif" },
@@ -93,6 +105,7 @@ function classifyFiles(files: FileList | File[]): DroppedFiles {
 export default function Home() {
   const [docxFile, setDocxFile] = useState<File | null>(null);
   const [xlsxFile, setXlsxFile] = useState<File | null>(null);
+  const [cachedUpload, setCachedUpload] = useState<CachedUpload | null>(null);
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState<UploadState>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -112,6 +125,19 @@ export default function Home() {
 
   const docxInputRef = useRef<HTMLInputElement>(null);
   const xlsxInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const raw = localStorage.getItem(uploadCacheKey);
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw) as CachedUpload;
+      if (parsed?.cacheId && parsed?.docxName && parsed?.xlsxName) {
+        setCachedUpload(parsed);
+      }
+    } catch {
+      localStorage.removeItem(uploadCacheKey);
+    }
+  }, []);
 
   const emailHeader = useMemo(() => {
     if (!preview?.headers) return null;
@@ -182,6 +208,15 @@ export default function Home() {
         try {
           const data = JSON.parse(xhr.responseText) as PreviewPayload;
           setPreview(data);
+          if (data.cache_id && data.cached_files) {
+            const nextCached: CachedUpload = {
+              cacheId: data.cache_id,
+              docxName: data.cached_files.docx_name,
+              xlsxName: data.cached_files.xlsx_name,
+            };
+            setCachedUpload(nextCached);
+            localStorage.setItem(uploadCacheKey, JSON.stringify(nextCached));
+          }
           setStatus("done");
           setProgress(100);
         } catch (err) {
@@ -212,6 +247,8 @@ export default function Home() {
     setDraftStatus("idle");
     setDraftMessage(null);
     setAttachmentsDir("");
+    setCachedUpload(null);
+    localStorage.removeItem(uploadCacheKey);
     if (docxInputRef.current) docxInputRef.current.value = "";
     if (xlsxInputRef.current) xlsxInputRef.current.value = "";
   };
@@ -246,12 +283,12 @@ export default function Home() {
   };
 
   const saveDrafts = async () => {
-    if (!preview) {
+    if (!preview && !cachedUpload) {
       setDraftStatus("error");
       setDraftMessage("尚未產生預覽，無法儲存草稿。");
       return;
     }
-    if (missingHeaders.length > 0) {
+    if (preview && missingHeaders.length > 0) {
       setDraftStatus("error");
       setDraftMessage("找不到必要欄位（email / subject），請檢查 Excel 標題列。");
       return;
@@ -260,13 +297,16 @@ export default function Home() {
     setDraftMessage(null);
     try {
       const formData = new FormData();
-      if (!docxFile || !xlsxFile) {
+      if (docxFile && xlsxFile) {
+        formData.append("docx_file", docxFile);
+        formData.append("xlsx_file", xlsxFile);
+      } else if (cachedUpload?.cacheId) {
+        formData.append("cache_id", cachedUpload.cacheId);
+      } else {
         setDraftStatus("error");
         setDraftMessage("請先上傳 DOCX 與 XLSX。");
         return;
       }
-      formData.append("docx_file", docxFile);
-      formData.append("xlsx_file", xlsxFile);
 
       const url = new URL(`${apiBase}/api/drafts/batch`, window.location.origin);
       url.searchParams.set("font", selectedFont);
@@ -384,13 +424,13 @@ export default function Home() {
               <div className="file-tile">
                 <p className="file-label">模板</p>
                 <p className="file-name">
-                  {docxFile ? docxFile.name : "尚未選擇 DOCX"}
+                  {docxFile ? docxFile.name : cachedUpload?.docxName ?? "尚未選擇 DOCX"}
                 </p>
               </div>
               <div className="file-tile">
                 <p className="file-label">收件人清單</p>
                 <p className="file-name">
-                  {xlsxFile ? xlsxFile.name : "尚未選擇 XLSX"}
+                  {xlsxFile ? xlsxFile.name : cachedUpload?.xlsxName ?? "尚未選擇 XLSX"}
                 </p>
               </div>
             </div>
@@ -473,7 +513,7 @@ export default function Home() {
                     附件欄位：{preview.detected_fields.attachments.join("、")}
                   </span>
                 )}
-              {missingHeaders.length > 0 && (
+              {preview && missingHeaders.length > 0 && (
                 <span className="error">缺少必要欄位：{missingHeaders.join("、")}</span>
               )}
             </div>

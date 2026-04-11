@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
@@ -11,6 +11,9 @@ import re
 import traceback
 import io
 from dotenv import load_dotenv
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 from api.core.processor import convert_docx_to_html, inject_variables, resolve_gmail_font
 from api.core.gmail_svc import (
     create_draft,
@@ -20,6 +23,7 @@ from api.core.gmail_svc import (
     revoke_user_credentials,
 )
 import os
+from uuid import uuid4
 load_dotenv()
 port = int(os.environ.get("PORT", 6311))
 SESSION_SECRET = os.environ.get("SESSION_SECRET")
@@ -137,6 +141,7 @@ ATTACHMENTS_ROOTS = [
     for p in os.environ.get("ATTACHMENTS_ROOTS", str(ATTACHMENTS_DIR)).split(",")
     if p.strip()
 ]
+UPLOAD_CACHE_DIR = Path(os.environ.get("UPLOAD_CACHE_DIR", "/tmp/draftcopier_uploads")).resolve()
 
 
 def _normalize_header(value: object) -> str:
@@ -207,6 +212,104 @@ def _resolve_attachment_from_disk(
     content = candidate.read_bytes()
     mime_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
     return {"filename": candidate.name, "content": content, "mime_type": mime_type}
+
+
+def _safe_upload_name(name: str, fallback: str) -> str:
+    base = Path(name or "").name.strip()
+    return base or fallback
+
+
+def _cache_root_for_user(user_key: str) -> Path:
+    safe_user = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in user_key)
+    return UPLOAD_CACHE_DIR / safe_user
+
+
+def _write_upload_cache(
+    *,
+    user_key: str,
+    docx_name: str,
+    docx_content: bytes,
+    xlsx_name: str,
+    xlsx_content: bytes,
+) -> dict[str, str]:
+    cache_id = uuid4().hex
+    cache_root = _cache_root_for_user(user_key)
+    cache_dir = cache_root / cache_id
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_docx_name = _safe_upload_name(docx_name, "template.docx")
+    safe_xlsx_name = _safe_upload_name(xlsx_name, "list.xlsx")
+    (cache_dir / "template.docx").write_bytes(docx_content)
+    (cache_dir / "recipients.xlsx").write_bytes(xlsx_content)
+    (cache_dir / "meta.txt").write_text(f"{safe_docx_name}\n{safe_xlsx_name}\n", encoding="utf-8")
+
+    return {"cache_id": cache_id, "docx_name": safe_docx_name, "xlsx_name": safe_xlsx_name}
+
+
+def _read_upload_cache(*, user_key: str, cache_id: str) -> dict[str, bytes | str]:
+    if not cache_id or not re.fullmatch(r"[a-f0-9]{32}", cache_id):
+        raise HTTPException(status_code=400, detail={"error": "invalid_cache_id"})
+    cache_dir = _cache_root_for_user(user_key) / cache_id
+    docx_path = cache_dir / "template.docx"
+    xlsx_path = cache_dir / "recipients.xlsx"
+    if not docx_path.exists() or not xlsx_path.exists():
+        raise HTTPException(status_code=400, detail={"error": "cache_not_found", "cache_id": cache_id})
+
+    docx_name = "template.docx"
+    xlsx_name = "list.xlsx"
+    meta_path = cache_dir / "meta.txt"
+    if meta_path.exists():
+        lines = meta_path.read_text(encoding="utf-8").splitlines()
+        if len(lines) >= 2:
+            docx_name = lines[0] or docx_name
+            xlsx_name = lines[1] or xlsx_name
+
+    return {
+        "docx_name": docx_name,
+        "xlsx_name": xlsx_name,
+        "docx_content": docx_path.read_bytes(),
+        "xlsx_content": xlsx_path.read_bytes(),
+    }
+
+
+def get_attachment_content(file_path: str, credentials: Credentials) -> dict[str, str | bytes]:
+    """
+    雙軌：本地存在則讀檔；否則依檔名從 Google Drive 備援。
+    回傳格式須與 _resolve_attachment_from_disk 相同：filename, content, mime_type。
+    """
+    if os.path.exists(file_path):
+        local_path = Path(file_path)
+        content = local_path.read_bytes()
+        mime_type = mimetypes.guess_type(local_path.name)[0] or "application/octet-stream"
+        return {"filename": local_path.name, "content": content, "mime_type": mime_type}
+
+    filename = os.path.basename(file_path)
+    if not filename:
+        raise FileNotFoundError(f"Invalid attachment path: {file_path!r}")
+
+    drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+    query_name = filename.replace("'", "\\'")
+    query = f"name='{query_name}' and trashed=false"
+    results = drive_service.files().list(
+        q=query,
+        fields="files(id,name,mimeType)",
+        pageSize=1,
+    ).execute()
+    items = results.get("files", [])
+    if not items:
+        raise FileNotFoundError(f"Attachment not found on disk or Google Drive: {filename}")
+
+    item = items[0]
+    request = drive_service.files().get_media(fileId=item["id"])
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+    mime_type = item.get("mimeType") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return {"filename": item.get("name", filename), "content": fh.getvalue(), "mime_type": mime_type}
+
 
 def _require_session_user_key(request: Request) -> str:
     user_key = request.session.get("user_key")
@@ -292,8 +395,9 @@ def create_draft_route(request: Request, payload: DraftRequest):
 @app.post("/api/drafts/batch")
 async def create_drafts_batch(
     request: Request,
-    docx_file: UploadFile = File(...),
-    xlsx_file: UploadFile = File(...),
+    docx_file: UploadFile | None = File(None),
+    xlsx_file: UploadFile | None = File(None),
+    cache_id: str | None = Form(None),
     sheet: str | None = None,
     font: str | None = None,
     attachments_dir: str | None = None,
@@ -302,11 +406,24 @@ async def create_drafts_batch(
         user_key = _require_session_user_key(request)
         creds = load_user_credentials(user_key)
 
-        docx_content = await docx_file.read()
+        if docx_file and xlsx_file:
+            docx_content = await docx_file.read()
+            xlsx_content = await xlsx_file.read()
+        elif cache_id:
+            cached = _read_upload_cache(user_key=user_key, cache_id=cache_id)
+            docx_content = cached["docx_content"]
+            xlsx_content = cached["xlsx_content"]
+            if not isinstance(docx_content, bytes) or not isinstance(xlsx_content, bytes):
+                raise HTTPException(status_code=500, detail={"error": "invalid_cache_payload"})
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "missing_upload_source", "message": "Need docx/xlsx files or cache_id."},
+            )
+
         font_family = resolve_gmail_font(font)
         html_template = convert_docx_to_html(docx_content, base_font_family=font_family)
 
-        xlsx_content = await xlsx_file.read()
         sheet_name: int | str = 0
         if sheet is not None:
             sheet = sheet.strip()
@@ -355,26 +472,33 @@ async def create_drafts_batch(
                 if idx <= 3:
                     print(f"[attachments] row {idx} header={header!r} type={type(value)} value={value!r}")
                 for name in _split_attachment_names(value):
-                    if not Path(name).is_absolute() and not base_dir.exists():
-                        print(f"[ERROR] 找不到附件根目錄: {base_dir} (嘗試讀取相對路徑附件 '{name}')")
-                        raise HTTPException(
-                            status_code=400,
-                            detail={
-                                "error": "missing_attachments_dir",
-                                "message": f"表格中指定了相對路徑附件 '{name}'，但附件資料夾 {base_dir} 不存在。請建立該資料夾並放入檔案。",
-                            },
+                    resolved: dict[str, str | bytes] | None = None
+                    name_path = Path(name)
+                    should_try_local = name_path.is_absolute() or base_dir.exists()
+                    if should_try_local:
+                        resolved = _resolve_attachment_from_disk(
+                            name=name,
+                            base_dir=base_dir,
+                            allow_absolute=ALLOW_ABSOLUTE_ATTACHMENTS,
+                            roots=ATTACHMENTS_ROOTS,
                         )
-                    resolved = _resolve_attachment_from_disk(
-                        name=name,
-                        base_dir=base_dir,
-                        allow_absolute=ALLOW_ABSOLUTE_ATTACHMENTS,
-                        roots=ATTACHMENTS_ROOTS,
-                    )
+                    elif idx <= 3:
+                        print(
+                            f"[attachments] base_dir 不存在，略過本地相對路徑，改用 Drive 查詢: row={idx} name={name!r}"
+                        )
                     if not resolved:
-                        print(f"[ERROR] 找不到附件檔案: {name} (位於第 {idx} 列)")
-                        errors.append({"row": idx, "field": "attachment", "name": name})
-                    else:
-                        attachments_for_row.append(resolved)
+                        print(f"[attachments] Drive fallback lookup: row={idx} name={name!r}")
+                        try:
+                            resolved = get_attachment_content(name, creds)
+                            if idx <= 3:
+                                print(
+                                    f"[attachments] Drive fallback success: row={idx} name={name!r} resolved={resolved.get('filename')!r}"
+                                )
+                        except Exception as e:
+                            print(f"[ERROR] 找不到附件檔案: {name} (位於第 {idx} 列) err={e}")
+                            errors.append({"row": idx, "field": "attachment", "name": name})
+                            continue
+                    attachments_for_row.append(resolved)
             row_attachments.append(attachments_for_row)
 
         if errors:
@@ -409,12 +533,14 @@ async def create_drafts_batch(
 
 @app.post("/api/process")
 async def process_files(
+    request: Request,
     docx_file: UploadFile = File(...),
     xlsx_file: UploadFile = File(...),
     sheet: str | None = None,
     font: str | None = None,
 ):
     try:
+        user_key = request.session.get("user_key") or "guest_user"
         # 1. 讀取 Word 模板並轉為 HTML
         docx_content = await docx_file.read()
         font_family = resolve_gmail_font(font)
@@ -422,6 +548,14 @@ async def process_files(
 
         # 2. 使用 Pandas 讀取 Excel 數據
         xlsx_content = await xlsx_file.read()
+        cache_info = _write_upload_cache(
+            user_key=user_key,
+            docx_name=docx_file.filename or "template.docx",
+            docx_content=docx_content,
+            xlsx_name=xlsx_file.filename or "list.xlsx",
+            xlsx_content=xlsx_content,
+        )
+        request.session["latest_cache_id"] = cache_info["cache_id"]
         sheet_name: int | str = 0
         if sheet is not None:
             sheet = sheet.strip()
@@ -459,6 +593,11 @@ async def process_files(
                 "email": email_header,
                 "subject": subject_header,
                 "attachments": attachment_headers,
+            },
+            "cache_id": cache_info["cache_id"],
+            "cached_files": {
+                "docx_name": cache_info["docx_name"],
+                "xlsx_name": cache_info["xlsx_name"],
             },
         }
     except Exception as e:

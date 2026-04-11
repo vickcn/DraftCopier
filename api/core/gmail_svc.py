@@ -16,7 +16,10 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
-DEFAULT_SCOPES = ["https://www.googleapis.com/auth/gmail.compose"]
+DEFAULT_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 
 # Detact Vercel environment for writable /tmp directory
 IS_VERCEL = os.getenv("VERCEL") == "1"
