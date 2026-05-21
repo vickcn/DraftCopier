@@ -387,7 +387,17 @@ def _require_session_user_key(request: Request) -> str:
 @app.get("/api/session/info")
 def session_info(request: Request):
     user_key = request.session.get("user_key")
-    return {"user_key": user_key}
+    email = request.session.get("user_email")
+    return {"user_key": user_key, "email": email}
+
+
+def _fetch_gmail_email(creds: Credentials) -> str | None:
+    try:
+        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        profile = service.users().getProfile(userId="me").execute()
+        return profile.get("emailAddress")
+    except Exception:
+        return None
 
 
 class RestoreSessionRequest(BaseModel):
@@ -399,11 +409,16 @@ def session_restore(request: Request, body: RestoreSessionRequest):
     if not re.fullmatch(r"[a-f0-9]{32}", body.user_key):
         raise HTTPException(status_code=400, detail="Invalid user_key")
     try:
-        load_user_credentials(body.user_key)
+        creds = load_user_credentials(body.user_key)
         request.session["user_key"] = body.user_key
-        return {"ok": True, "restored": True}
+        email = request.session.get("user_email")
+        if not email:
+            email = _fetch_gmail_email(creds)
+            if email:
+                request.session["user_email"] = email
+        return {"ok": True, "restored": True, "email": email}
     except Exception:
-        return {"ok": True, "restored": False}
+        return {"ok": True, "restored": False, "email": None}
 
 
 @app.get("/api/auth/google")
@@ -444,7 +459,10 @@ def google_auth_callback(request: Request, code: str, state: str):
         code_verifier = request.session.get("oauth_code_verifier")
         
         creds = exchange_code_for_token(code=code, state=state, user_key=user_key, code_verifier=code_verifier)
-        
+        email = _fetch_gmail_email(creds)
+        if email:
+            request.session["user_email"] = email
+
         request.session.pop("oauth_state", None)
         request.session.pop("oauth_user_key", None)
         request.session.pop("oauth_code_verifier", None)
