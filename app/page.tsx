@@ -133,9 +133,7 @@ export default function Home() {
   const [draftMessage, setDraftMessage] = useState<string | null>(null);
   const [draftFailedItems, setDraftFailedItems] = useState<BatchFailedItem[]>([]);
   const [attachmentsDir, setAttachmentsDir] = useState("");
-  const [gmailEmail, setGmailEmail] = useState<string | null>(
-    () => localStorage.getItem(userEmailCacheKey)
-  );
+  const [gmailEmail, setGmailEmail] = useState<string | null>(null);
 
   const statusLabel: Record<UploadState, string> = {
     idle: "待命",
@@ -151,6 +149,9 @@ export default function Home() {
   // 每次載入時，嘗試從 localStorage 還原 session（跨 session 保持登入狀態）
   useEffect(() => {
     const restoreSession = async () => {
+      const cachedEmail = localStorage.getItem(userEmailCacheKey);
+      if (cachedEmail) setGmailEmail(cachedEmail);
+
       const savedKey = localStorage.getItem(userKeyCacheKey);
       if (!savedKey) return;
       try {
