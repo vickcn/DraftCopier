@@ -26,29 +26,47 @@ import os
 from uuid import uuid4
 load_dotenv()
 port = int(os.environ.get("PORT", 6311))
+IS_PRODUCTION = os.getenv("VERCEL") == "1"
+
 SESSION_SECRET = os.environ.get("SESSION_SECRET")
 if not SESSION_SECRET:
     raise RuntimeError(
         "[CRITICAL] Missing required environment variable: SESSION_SECRET. "
         "Set it before starting the server."
     )
-DEV_LOGIN_ENABLED = os.environ.get("DEV_LOGIN_ENABLED", "false").lower() == "true"
 
-print(f"[BOOT] Environment: {'Vercel' if os.getenv('VERCEL') == '1' else 'Local'}")
+# 開發環境預設開啟 dev login，正式環境須明確設定才開啟
+DEV_LOGIN_ENABLED = os.environ.get(
+    "DEV_LOGIN_ENABLED", "false" if IS_PRODUCTION else "true"
+).lower() == "true"
+
+print(f"[BOOT] Environment: {'Production (Vercel)' if IS_PRODUCTION else 'Local'}")
+print(f"[BOOT] DEV_LOGIN_ENABLED: {DEV_LOGIN_ENABLED}")
 print(f"[BOOT] CORS Origins: {os.environ.get('CORS_ORIGINS', 'Default')}")
 
 app = FastAPI()
+
+# 正式環境：CORS_ORIGINS 必須明確設定，不提供預設值（未設定則封鎖所有跨域請求）
+# 開發環境：預設允許常見的本機端口
+_cors_default = "" if IS_PRODUCTION else "http://localhost:3000,http://localhost:6406"
 cors_origins = [
-    origin.strip()
-    for origin in os.environ.get("CORS_ORIGINS", "http://localhost:6406").split(",")
-    if origin.strip()
+    o.strip()
+    for o in os.environ.get("CORS_ORIGINS", _cors_default).split(",")
+    if o.strip()
 ]
+if IS_PRODUCTION and not cors_origins:
+    print("[WARN] CORS_ORIGINS is not set. All cross-origin requests will be blocked.")
+
+# 正式環境收緊 methods/headers；開發環境保持寬鬆
+cors_methods = ["GET", "POST", "OPTIONS"] if IS_PRODUCTION else ["*"]
+cors_headers = ["Content-Type", "Authorization"] if IS_PRODUCTION else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=cors_methods,
+    allow_headers=cors_headers,
 )
 app.add_middleware(
     SessionMiddleware,
