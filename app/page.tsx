@@ -320,10 +320,6 @@ export default function Home() {
   const connectGmail = async () => {
     setDraftMessage(null);
     try {
-      await fetch(`${apiBase}/api/dev/login`, {
-        method: "POST",
-        credentials: "include",
-      });
       const response = await fetch(`${apiBase}/api/auth/google`, {
         method: "GET",
         credentials: "include",
