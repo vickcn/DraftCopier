@@ -28,9 +28,11 @@ load_dotenv()
 port = int(os.environ.get("PORT", 6311))
 SESSION_SECRET = os.environ.get("SESSION_SECRET")
 if not SESSION_SECRET:
-    print("[CRITICAL] Missing environment variable: SESSION_SECRET")
-    # 給予一個暫時的預設值，讓 API 至少能啟動以便記錄日誌
-    SESSION_SECRET = "fallback_secret_please_set_this_in_vercel"
+    raise RuntimeError(
+        "[CRITICAL] Missing required environment variable: SESSION_SECRET. "
+        "Set it before starting the server."
+    )
+DEV_LOGIN_ENABLED = os.environ.get("DEV_LOGIN_ENABLED", "false").lower() == "true"
 
 print(f"[BOOT] Environment: {'Vercel' if os.getenv('VERCEL') == '1' else 'Local'}")
 print(f"[BOOT] CORS Origins: {os.environ.get('CORS_ORIGINS', 'Default')}")
@@ -79,8 +81,9 @@ def root_login_page():
     <script>
       const btn = document.getElementById("loginBtn");
       btn.addEventListener("click", async () => {
-        await fetch("/api/dev/login", { method: "POST" });
-        window.location.href = "/api/auth/google";
+        const res = await fetch("/api/auth/google");
+        const data = await res.json();
+        if (data.auth_url) window.location.href = data.auth_url;
       });
     </script>
   </body>
@@ -90,11 +93,15 @@ def root_login_page():
 
 @app.get("/api/dev/login")
 def dev_login_get(request: Request):
+    if not DEV_LOGIN_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
     request.session["user_key"] = "dev_user"
     return {"ok": True, "user_key": "dev_user", "method": "GET"}
 
 @app.post("/api/dev/login")
 def dev_login(request: Request):
+    if not DEV_LOGIN_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
     request.session["user_key"] = "dev_user"
     return {"ok": True, "user_key": "dev_user"}
 
@@ -339,15 +346,9 @@ def _build_preview_payload(
 
 def get_attachment_content(file_path: str, credentials: Credentials) -> dict[str, str | bytes]:
     """
-    雙軌：本地存在則讀檔；否則依檔名從 Google Drive 備援。
-    回傳格式須與 _resolve_attachment_from_disk 相同：filename, content, mime_type。
+    Google Drive fallback：依檔名從 Drive 查詢並下載。
+    本地檔案解析須透過 _resolve_attachment_from_disk（含根目錄驗證），不在此處理。
     """
-    if os.path.exists(file_path):
-        local_path = Path(file_path)
-        content = local_path.read_bytes()
-        mime_type = mimetypes.guess_type(local_path.name)[0] or "application/octet-stream"
-        return {"filename": local_path.name, "content": content, "mime_type": mime_type}
-
     filename = os.path.basename(file_path)
     if not filename:
         raise FileNotFoundError(f"Invalid attachment path: {file_path!r}")
@@ -382,10 +383,51 @@ def _require_session_user_key(request: Request) -> str:
         raise HTTPException(status_code=401, detail="Missing session user_key")
     return user_key
 
+
+@app.get("/api/session/info")
+def session_info(request: Request):
+    user_key = request.session.get("user_key")
+    email = request.session.get("user_email")
+    return {"user_key": user_key, "email": email}
+
+
+def _fetch_gmail_email(creds: Credentials) -> str | None:
+    try:
+        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        profile = service.users().getProfile(userId="me").execute()
+        return profile.get("emailAddress")
+    except Exception:
+        return None
+
+
+class RestoreSessionRequest(BaseModel):
+    user_key: str
+
+
+@app.post("/api/session/restore")
+def session_restore(request: Request, body: RestoreSessionRequest):
+    if not re.fullmatch(r"[a-f0-9]{32}", body.user_key):
+        raise HTTPException(status_code=400, detail="Invalid user_key")
+    try:
+        creds = load_user_credentials(body.user_key)
+        request.session["user_key"] = body.user_key
+        email = request.session.get("user_email")
+        if not email:
+            email = _fetch_gmail_email(creds)
+            if email:
+                request.session["user_email"] = email
+        return {"ok": True, "restored": True, "email": email}
+    except Exception:
+        return {"ok": True, "restored": False, "email": None}
+
+
 @app.get("/api/auth/google")
 def google_auth(request: Request):
     try:
-        user_key = _require_session_user_key(request)
+        user_key = request.session.get("user_key")
+        if not user_key:
+            user_key = uuid4().hex
+            request.session["user_key"] = user_key
         print(f"[auth/google] user_key={user_key!r}")
         print(f"[auth/google] GOOGLE_CLIENT_ID set: {bool(os.environ.get('GOOGLE_CLIENT_ID'))}")
         print(f"[auth/google] GOOGLE_CLIENT_SECRET set: {bool(os.environ.get('GOOGLE_CLIENT_SECRET'))}")
@@ -417,7 +459,10 @@ def google_auth_callback(request: Request, code: str, state: str):
         code_verifier = request.session.get("oauth_code_verifier")
         
         creds = exchange_code_for_token(code=code, state=state, user_key=user_key, code_verifier=code_verifier)
-        
+        email = _fetch_gmail_email(creds)
+        if email:
+            request.session["user_email"] = email
+
         request.session.pop("oauth_state", None)
         request.session.pop("oauth_user_key", None)
         request.session.pop("oauth_code_verifier", None)

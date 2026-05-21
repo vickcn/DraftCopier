@@ -185,8 +185,10 @@ def inject_variables(html_template: str, row_data: Dict[str, Any]) -> str:
     # 使用正則表達式尋找 {{Key}} 並從 row_data 抓取對應的 Value
     def replace_match(match):
         key = match.group(1).strip()
-        # 若 Excel 沒這欄位，則保持原樣或回傳空字串
-        return str(normalized_row.get(key, match.group(0)))
+        value = normalized_row.get(key)
+        if value is None:
+            return match.group(0)
+        return escape(str(value))
 
     # 匹配 {{ variable_name }} 格式
     pattern = r"\{\{\s*(.*?)\s*\}\}"

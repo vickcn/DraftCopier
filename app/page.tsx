@@ -49,6 +49,8 @@ type BatchSaveResponse = {
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "";
 const uploadCacheKey = "draftcopier_upload_cache_v1";
+const userKeyCacheKey = "draftcopier_user_key_v1";
+const userEmailCacheKey = "draftcopier_user_email_v1";
 const fontOptions = [
   { label: "Sans Serif", value: "Sans Serif" },
   { label: "Serif", value: "Serif" },
@@ -131,6 +133,9 @@ export default function Home() {
   const [draftMessage, setDraftMessage] = useState<string | null>(null);
   const [draftFailedItems, setDraftFailedItems] = useState<BatchFailedItem[]>([]);
   const [attachmentsDir, setAttachmentsDir] = useState("");
+  const [gmailEmail, setGmailEmail] = useState<string | null>(
+    () => localStorage.getItem(userEmailCacheKey)
+  );
 
   const statusLabel: Record<UploadState, string> = {
     idle: "待命",
@@ -142,6 +147,59 @@ export default function Home() {
   const docxInputRef = useRef<HTMLInputElement>(null);
   const xlsxInputRef = useRef<HTMLInputElement>(null);
   const restoreAttemptedRef = useRef<string | null>(null);
+
+  // 每次載入時，嘗試從 localStorage 還原 session（跨 session 保持登入狀態）
+  useEffect(() => {
+    const restoreSession = async () => {
+      const savedKey = localStorage.getItem(userKeyCacheKey);
+      if (!savedKey) return;
+      try {
+        const res = await fetch(`${apiBase}/api/session/restore`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_key: savedKey }),
+        });
+        const data = (await res.json()) as { ok: boolean; restored: boolean; email?: string | null };
+        if (!data.restored) {
+          localStorage.removeItem(userKeyCacheKey);
+          localStorage.removeItem(userEmailCacheKey);
+          setGmailEmail(null);
+        } else if (data.email) {
+          setGmailEmail(data.email);
+          localStorage.setItem(userEmailCacheKey, data.email);
+        }
+      } catch {
+        // 網路錯誤，不影響後續操作
+      }
+    };
+    void restoreSession();
+  }, []);
+
+  // OAuth 授權成功後，從 session 取得 user_key 並存入 localStorage
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("auth") !== "success") return;
+    const saveUserKey = async () => {
+      try {
+        const res = await fetch(`${apiBase}/api/session/info`, {
+          credentials: "include",
+        });
+        const data = (await res.json()) as { user_key?: string; email?: string };
+        if (data.user_key) {
+          localStorage.setItem(userKeyCacheKey, data.user_key);
+        }
+        if (data.email) {
+          setGmailEmail(data.email);
+          localStorage.setItem(userEmailCacheKey, data.email);
+        }
+      } catch {
+        // ignore
+      }
+      window.history.replaceState({}, "", window.location.pathname);
+    };
+    void saveUserKey();
+  }, []);
 
   useEffect(() => {
     const raw = localStorage.getItem(uploadCacheKey);
@@ -320,10 +378,6 @@ export default function Home() {
   const connectGmail = async () => {
     setDraftMessage(null);
     try {
-      await fetch(`${apiBase}/api/dev/login`, {
-        method: "POST",
-        credentials: "include",
-      });
       const response = await fetch(`${apiBase}/api/auth/google`, {
         method: "GET",
         credentials: "include",
@@ -460,8 +514,13 @@ export default function Home() {
           <div className="card">
             <div className="actions">
               <button className="ghost" onClick={connectGmail}>
-                先連結 Gmail
+                {gmailEmail ? "重新連結 Gmail" : "先連結 Gmail"}
               </button>
+              {gmailEmail && (
+                <span className="field-label" style={{ alignSelf: "center" }}>
+                  已連結：{gmailEmail}
+                </span>
+              )}
             </div>
             <div
               className={`dropzone ${isDragActive ? "active" : ""}`}
