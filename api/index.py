@@ -383,6 +383,29 @@ def _require_session_user_key(request: Request) -> str:
         raise HTTPException(status_code=401, detail="Missing session user_key")
     return user_key
 
+
+@app.get("/api/session/info")
+def session_info(request: Request):
+    user_key = request.session.get("user_key")
+    return {"user_key": user_key}
+
+
+class RestoreSessionRequest(BaseModel):
+    user_key: str
+
+
+@app.post("/api/session/restore")
+def session_restore(request: Request, body: RestoreSessionRequest):
+    if not re.fullmatch(r"[a-f0-9]{32}", body.user_key):
+        raise HTTPException(status_code=400, detail="Invalid user_key")
+    try:
+        load_user_credentials(body.user_key)
+        request.session["user_key"] = body.user_key
+        return {"ok": True, "restored": True}
+    except Exception:
+        return {"ok": True, "restored": False}
+
+
 @app.get("/api/auth/google")
 def google_auth(request: Request):
     try:

@@ -49,6 +49,7 @@ type BatchSaveResponse = {
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "";
 const uploadCacheKey = "draftcopier_upload_cache_v1";
+const userKeyCacheKey = "draftcopier_user_key_v1";
 const fontOptions = [
   { label: "Sans Serif", value: "Sans Serif" },
   { label: "Serif", value: "Serif" },
@@ -142,6 +143,50 @@ export default function Home() {
   const docxInputRef = useRef<HTMLInputElement>(null);
   const xlsxInputRef = useRef<HTMLInputElement>(null);
   const restoreAttemptedRef = useRef<string | null>(null);
+
+  // 每次載入時，嘗試從 localStorage 還原 session（跨 session 保持登入狀態）
+  useEffect(() => {
+    const restoreSession = async () => {
+      const savedKey = localStorage.getItem(userKeyCacheKey);
+      if (!savedKey) return;
+      try {
+        const res = await fetch(`${apiBase}/api/session/restore`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_key: savedKey }),
+        });
+        const data = (await res.json()) as { ok: boolean; restored: boolean };
+        if (!data.restored) {
+          localStorage.removeItem(userKeyCacheKey);
+        }
+      } catch {
+        // 網路錯誤，不影響後續操作
+      }
+    };
+    void restoreSession();
+  }, []);
+
+  // OAuth 授權成功後，從 session 取得 user_key 並存入 localStorage
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("auth") !== "success") return;
+    const saveUserKey = async () => {
+      try {
+        const res = await fetch(`${apiBase}/api/session/info`, {
+          credentials: "include",
+        });
+        const data = (await res.json()) as { user_key?: string };
+        if (data.user_key) {
+          localStorage.setItem(userKeyCacheKey, data.user_key);
+        }
+      } catch {
+        // ignore
+      }
+      window.history.replaceState({}, "", window.location.pathname);
+    };
+    void saveUserKey();
+  }, []);
 
   useEffect(() => {
     const raw = localStorage.getItem(uploadCacheKey);
