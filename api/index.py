@@ -395,6 +395,37 @@ def get_attachment_content(file_path: str, credentials: Credentials) -> dict[str
     return {"filename": item.get("name", filename), "content": fh.getvalue(), "mime_type": mime_type}
 
 
+def _validate_drive_file_id(file_id: str) -> str:
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{10,200}", file_id):
+        raise HTTPException(status_code=400, detail="Invalid Drive file ID format")
+    return file_id
+
+
+def _download_drive_file(file_id: str, credentials: Credentials) -> tuple[bytes, str]:
+    DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+    meta = drive_service.files().get(fileId=file_id, fields="name,mimeType").execute()
+    filename = meta.get("name", file_id)
+    mime_type = meta.get("mimeType", "")
+    if mime_type == "application/vnd.google-apps.document":
+        req = drive_service.files().export_media(fileId=file_id, mimeType=DOCX_MIME)
+        if not filename.lower().endswith(".docx"):
+            filename += ".docx"
+    elif mime_type == "application/vnd.google-apps.spreadsheet":
+        req = drive_service.files().export_media(fileId=file_id, mimeType=XLSX_MIME)
+        if not filename.lower().endswith(".xlsx"):
+            filename += ".xlsx"
+    else:
+        req = drive_service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return fh.getvalue(), filename
+
+
 def _require_session_user_key(request: Request) -> str:
     user_key = request.session.get("user_key")
     if not user_key:
@@ -492,6 +523,18 @@ def google_auth_callback(request: Request, code: str, state: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/auth/access-token")
+def get_access_token(request: Request):
+    try:
+        user_key = _require_session_user_key(request)
+        creds = load_user_credentials(user_key)
+        return {"access_token": creds.token}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/auth/revoke")
 def google_auth_revoke(request: Request):
     try:
@@ -526,6 +569,8 @@ async def create_drafts_batch(
     docx_file: UploadFile | None = File(None),
     xlsx_file: UploadFile | None = File(None),
     cache_id: str | None = Form(None),
+    docx_drive_id: str | None = Form(None),
+    xlsx_drive_id: str | None = Form(None),
     sheet: str | None = None,
     font: str | None = None,
     attachments_dir: str | None = None,
@@ -535,19 +580,24 @@ async def create_drafts_batch(
         creds = load_user_credentials(user_key)
         cache_namespace = _get_upload_cache_namespace(request)
 
-        if docx_file and xlsx_file:
-            docx_content = await docx_file.read()
-            xlsx_content = await xlsx_file.read()
-        elif cache_id:
+        if cache_id:
             cached = _read_upload_cache(namespace=cache_namespace, cache_id=cache_id)
             docx_content = cached["docx_content"]
             xlsx_content = cached["xlsx_content"]
             if not isinstance(docx_content, bytes) or not isinstance(xlsx_content, bytes):
                 raise HTTPException(status_code=500, detail={"error": "invalid_cache_payload"})
+        elif docx_file and xlsx_file:
+            docx_content = await docx_file.read()
+            xlsx_content = await xlsx_file.read()
+        elif docx_drive_id and xlsx_drive_id:
+            _validate_drive_file_id(docx_drive_id)
+            _validate_drive_file_id(xlsx_drive_id)
+            docx_content, _ = _download_drive_file(docx_drive_id, creds)
+            xlsx_content, _ = _download_drive_file(xlsx_drive_id, creds)
         else:
             raise HTTPException(
                 status_code=400,
-                detail={"error": "missing_upload_source", "message": "Need docx/xlsx files or cache_id."},
+                detail={"error": "missing_upload_source", "message": "Need docx/xlsx files, cache_id, or drive IDs."},
             )
 
         font_family = resolve_gmail_font(font)
@@ -716,23 +766,47 @@ def process_cached_preview(
 @app.post("/api/process")
 async def process_files(
     request: Request,
-    docx_file: UploadFile = File(...),
-    xlsx_file: UploadFile = File(...),
+    docx_file: UploadFile | None = File(None),
+    xlsx_file: UploadFile | None = File(None),
+    docx_drive_id: str | None = Form(None),
+    xlsx_drive_id: str | None = Form(None),
     sheet: str | None = None,
     font: str | None = None,
 ):
     try:
         cache_namespace = _get_upload_cache_namespace(request)
-        # 1. 讀取 Word 模板並轉為 HTML
-        docx_content = await docx_file.read()
+        creds: Credentials | None = None
 
-        # 2. 使用 Pandas 讀取 Excel 數據
-        xlsx_content = await xlsx_file.read()
+        def _get_creds() -> Credentials:
+            nonlocal creds
+            if creds is None:
+                user_key = _require_session_user_key(request)
+                creds = load_user_credentials(user_key)
+            return creds
+
+        if docx_file is not None:
+            docx_content = await docx_file.read()
+            docx_name = docx_file.filename or "template.docx"
+        elif docx_drive_id:
+            _validate_drive_file_id(docx_drive_id)
+            docx_content, docx_name = _download_drive_file(docx_drive_id, _get_creds())
+        else:
+            raise HTTPException(status_code=400, detail={"error": "missing_docx", "message": "Need docx_file or docx_drive_id"})
+
+        if xlsx_file is not None:
+            xlsx_content = await xlsx_file.read()
+            xlsx_name = xlsx_file.filename or "list.xlsx"
+        elif xlsx_drive_id:
+            _validate_drive_file_id(xlsx_drive_id)
+            xlsx_content, xlsx_name = _download_drive_file(xlsx_drive_id, _get_creds())
+        else:
+            raise HTTPException(status_code=400, detail={"error": "missing_xlsx", "message": "Need xlsx_file or xlsx_drive_id"})
+
         cache_info = _write_upload_cache(
             namespace=cache_namespace,
-            docx_name=docx_file.filename or "template.docx",
+            docx_name=docx_name,
             docx_content=docx_content,
-            xlsx_name=xlsx_file.filename or "list.xlsx",
+            xlsx_name=xlsx_name,
             xlsx_content=xlsx_content,
         )
         request.session["latest_cache_id"] = cache_info["cache_id"]
@@ -743,6 +817,8 @@ async def process_files(
             font=font,
             cache_info=cache_info,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})

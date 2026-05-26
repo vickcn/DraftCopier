@@ -2,6 +2,22 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
+function parseDriveFileId(input: string): string | null {
+  const s = input.trim();
+  if (/^[a-zA-Z0-9_-]{25,}$/.test(s)) return s;
+  const patterns = [
+    /\/file\/d\/([a-zA-Z0-9_-]+)/,
+    /\/document\/d\/([a-zA-Z0-9_-]+)/,
+    /\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/,
+    /[?&]id=([a-zA-Z0-9_-]+)/,
+  ];
+  for (const p of patterns) {
+    const m = s.match(p);
+    if (m) return m[1];
+  }
+  return null;
+}
+
 type PreviewPayload = {
   total_records: number;
   headers: string[];
@@ -48,6 +64,7 @@ type BatchSaveResponse = {
 };
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "";
+const googlePickerApiKey = process.env.NEXT_PUBLIC_GOOGLE_PICKER_API_KEY || "";
 const uploadCacheKey = "draftcopier_upload_cache_v1";
 const userKeyCacheKey = "draftcopier_user_key_v1";
 const userEmailCacheKey = "draftcopier_user_email_v1";
@@ -134,6 +151,12 @@ export default function Home() {
   const [draftFailedItems, setDraftFailedItems] = useState<BatchFailedItem[]>([]);
   const [attachmentsDir, setAttachmentsDir] = useState("");
   const [gmailEmail, setGmailEmail] = useState<string | null>(null);
+  const [docxDriveId, setDocxDriveId] = useState<string | null>(null);
+  const [xlsxDriveId, setXlsxDriveId] = useState<string | null>(null);
+  const [docxDriveName, setDocxDriveName] = useState<string | null>(null);
+  const [xlsxDriveName, setXlsxDriveName] = useState<string | null>(null);
+  const [docxLinkInput, setDocxLinkInput] = useState("");
+  const [xlsxLinkInput, setXlsxLinkInput] = useState("");
 
   const statusLabel: Record<UploadState, string> = {
     idle: "待命",
@@ -274,16 +297,132 @@ export default function Home() {
   }, [emailHeader, subjectHeader]);
 
   const canSubmit = useMemo(
-    () => !!docxFile && !!xlsxFile && status !== "uploading",
-    [docxFile, xlsxFile, status]
+    () =>
+      (!!docxFile || !!docxDriveId) &&
+      (!!xlsxFile || !!xlsxDriveId) &&
+      status !== "uploading",
+    [docxFile, xlsxFile, docxDriveId, xlsxDriveId, status]
   );
+
+  const loadPickerApi = (): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const g = (window as Record<string, unknown>).google as { picker?: unknown } | undefined;
+      if (g?.picker) { resolve(); return; }
+      if (document.getElementById("gapi-script")) {
+        const wait = setInterval(() => {
+          const gw = (window as Record<string, unknown>).google as { picker?: unknown } | undefined;
+          if (gw?.picker) { clearInterval(wait); resolve(); }
+        }, 100);
+        return;
+      }
+      const script = document.createElement("script");
+      script.id = "gapi-script";
+      script.src = "https://apis.google.com/js/api.js";
+      script.onload = () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (window as any).gapi.load("picker", resolve);
+      };
+      script.onerror = () => reject(new Error("Failed to load Google API script"));
+      document.head.appendChild(script);
+    });
+
+  const openDrivePicker = async (type: "docx" | "xlsx") => {
+    if (!gmailEmail) {
+      setError("請先連結 Gmail 才能使用 Drive 選取器。");
+      return;
+    }
+    try {
+      const res = await fetch(`${apiBase}/api/auth/access-token`, { credentials: "include" });
+      if (!res.ok) {
+        setError("無法取得 Drive 授權，請重新連結 Gmail。");
+        return;
+      }
+      const { access_token } = (await res.json()) as { access_token: string };
+      await loadPickerApi();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const google = (window as any).google;
+      const view = new google.picker.DocsView();
+      if (type === "docx") {
+        view.setMimeTypes(
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.google-apps.document"
+        );
+      } else {
+        view.setMimeTypes(
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/vnd.google-apps.spreadsheet"
+        );
+      }
+      const builder = new google.picker.PickerBuilder()
+        .addView(view)
+        .setOAuthToken(access_token)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .setCallback((data: any) => {
+          if (data.action === google.picker.Action.PICKED) {
+            const file = data.docs[0];
+            if (type === "docx") {
+              setDocxDriveId(file.id);
+              setDocxDriveName(file.name);
+              setDocxFile(null);
+            } else {
+              setXlsxDriveId(file.id);
+              setXlsxDriveName(file.name);
+              setXlsxFile(null);
+            }
+            setStatus("idle");
+            setProgress(0);
+            setPreview(null);
+            setDraftStatus("idle");
+            setDraftMessage(null);
+            setDraftFailedItems([]);
+          }
+        });
+      if (googlePickerApiKey) builder.setDeveloperKey(googlePickerApiKey);
+      builder.build().setVisible(true);
+    } catch {
+      setError("無法開啟 Google Drive 選取器，請改用貼上連結方式。");
+    }
+  };
+
+  const confirmDriveLink = (type: "docx" | "xlsx") => {
+    const input = type === "docx" ? docxLinkInput : xlsxLinkInput;
+    const fileId = parseDriveFileId(input);
+    if (!fileId) {
+      setError("無法解析 Drive 連結，請確認格式正確（例如 drive.google.com/file/d/...）。");
+      return;
+    }
+    const shortName = `Drive 檔案（${fileId.slice(0, 8)}…）`;
+    if (type === "docx") {
+      setDocxDriveId(fileId);
+      setDocxDriveName(shortName);
+      setDocxFile(null);
+      setDocxLinkInput("");
+    } else {
+      setXlsxDriveId(fileId);
+      setXlsxDriveName(shortName);
+      setXlsxFile(null);
+      setXlsxLinkInput("");
+    }
+    setStatus("idle");
+    setProgress(0);
+    setPreview(null);
+    setDraftStatus("idle");
+    setDraftMessage(null);
+    setDraftFailedItems([]);
+  };
 
   const handleDrop = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     setIsDragActive(false);
     const files = classifyFiles(event.dataTransfer.files);
-    if (files.docx) setDocxFile(files.docx);
-    if (files.xlsx) setXlsxFile(files.xlsx);
+    if (files.docx) {
+      setDocxFile(files.docx);
+      setDocxDriveId(null);
+      setDocxDriveName(null);
+    }
+    if (files.xlsx) {
+      setXlsxFile(files.xlsx);
+      setXlsxDriveId(null);
+      setXlsxDriveName(null);
+    }
     setStatus("idle");
     setProgress(0);
     setPreview(null);
@@ -293,8 +432,8 @@ export default function Home() {
   };
 
   const handleUpload = () => {
-    if (!docxFile || !xlsxFile) {
-      setError("請同時選擇 .docx 與 .xlsx 檔案。");
+    if ((!docxFile && !docxDriveId) || (!xlsxFile && !xlsxDriveId)) {
+      setError("請同時提供 .docx 模板與 .xlsx 清單（本機或 Drive）。");
       return;
     }
 
@@ -307,8 +446,10 @@ export default function Home() {
     setDraftFailedItems([]);
 
     const formData = new FormData();
-    formData.append("docx_file", docxFile);
-    formData.append("xlsx_file", xlsxFile);
+    if (docxFile) formData.append("docx_file", docxFile);
+    if (xlsxFile) formData.append("xlsx_file", xlsxFile);
+    if (docxDriveId) formData.append("docx_drive_id", docxDriveId);
+    if (xlsxDriveId) formData.append("xlsx_drive_id", xlsxDriveId);
 
     const url = new URL(`${apiBase}/api/process`, window.location.origin);
     url.searchParams.set("font", selectedFont);
@@ -362,6 +503,12 @@ export default function Home() {
   const resetFiles = () => {
     setDocxFile(null);
     setXlsxFile(null);
+    setDocxDriveId(null);
+    setXlsxDriveId(null);
+    setDocxDriveName(null);
+    setXlsxDriveName(null);
+    setDocxLinkInput("");
+    setXlsxLinkInput("");
     setProgress(0);
     setStatus("idle");
     setError(null);
@@ -422,11 +569,14 @@ export default function Home() {
     setDraftFailedItems([]);
     try {
       const formData = new FormData();
-      if (docxFile && xlsxFile) {
+      if (cachedUpload?.cacheId) {
+        formData.append("cache_id", cachedUpload.cacheId);
+      } else if (docxFile && xlsxFile) {
         formData.append("docx_file", docxFile);
         formData.append("xlsx_file", xlsxFile);
-      } else if (cachedUpload?.cacheId) {
-        formData.append("cache_id", cachedUpload.cacheId);
+      } else if (docxDriveId && xlsxDriveId) {
+        formData.append("docx_drive_id", docxDriveId);
+        formData.append("xlsx_drive_id", xlsxDriveId);
       } else {
         setDraftStatus("error");
         setDraftMessage("請先上傳 DOCX 與 XLSX。");
@@ -545,6 +695,8 @@ export default function Home() {
                     accept=".docx"
                     onChange={(event) => {
                       setDocxFile(event.target.files?.[0] ?? null);
+                      setDocxDriveId(null);
+                      setDocxDriveName(null);
                       setStatus("idle");
                       setProgress(0);
                       setPreview(null);
@@ -561,6 +713,8 @@ export default function Home() {
                     accept=".xlsx,.xls"
                     onChange={(event) => {
                       setXlsxFile(event.target.files?.[0] ?? null);
+                      setXlsxDriveId(null);
+                      setXlsxDriveName(null);
                       setStatus("idle");
                       setProgress(0);
                       setPreview(null);
@@ -570,19 +724,59 @@ export default function Home() {
                   />
                 </label>
               </div>
+
+              <div className="drive-section">
+                <p className="drop-subtitle" style={{ marginBottom: "0.5rem" }}>或從 Google Drive 匯入</p>
+
+                <div className="drive-row">
+                  <span className="drive-label">DOCX</span>
+                  <input
+                    className="text-input drive-link-input"
+                    type="text"
+                    placeholder="貼上 Drive 連結或 File ID"
+                    value={docxLinkInput}
+                    onChange={(e) => setDocxLinkInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") confirmDriveLink("docx"); }}
+                  />
+                  <button className="ghost drive-confirm-btn" onClick={() => confirmDriveLink("docx")}>確認</button>
+                  <button className="ghost drive-confirm-btn" onClick={() => void openDrivePicker("docx")}>選取</button>
+                </div>
+
+                <div className="drive-row">
+                  <span className="drive-label">XLSX</span>
+                  <input
+                    className="text-input drive-link-input"
+                    type="text"
+                    placeholder="貼上 Drive 連結或 File ID"
+                    value={xlsxLinkInput}
+                    onChange={(e) => setXlsxLinkInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") confirmDriveLink("xlsx"); }}
+                  />
+                  <button className="ghost drive-confirm-btn" onClick={() => confirmDriveLink("xlsx")}>確認</button>
+                  <button className="ghost drive-confirm-btn" onClick={() => void openDrivePicker("xlsx")}>選取</button>
+                </div>
+              </div>
             </div>
 
             <div className="file-grid">
               <div className="file-tile">
                 <p className="file-label">模板</p>
                 <p className="file-name">
-                  {docxFile ? docxFile.name : cachedUpload?.docxName ?? "尚未選擇 DOCX"}
+                  {docxFile
+                    ? docxFile.name
+                    : docxDriveName
+                    ? docxDriveName
+                    : cachedUpload?.docxName ?? "尚未選擇 DOCX"}
                 </p>
               </div>
               <div className="file-tile">
                 <p className="file-label">收件人清單</p>
                 <p className="file-name">
-                  {xlsxFile ? xlsxFile.name : cachedUpload?.xlsxName ?? "尚未選擇 XLSX"}
+                  {xlsxFile
+                    ? xlsxFile.name
+                    : xlsxDriveName
+                    ? xlsxDriveName
+                    : cachedUpload?.xlsxName ?? "尚未選擇 XLSX"}
                 </p>
               </div>
             </div>

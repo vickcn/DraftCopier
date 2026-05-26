@@ -433,6 +433,40 @@ body {
   padding: 60px 20px;
 }
 
+.drive-section {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.drive-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.drive-label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  min-width: 36px;
+  flex-shrink: 0;
+}
+
+.drive-link-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.85rem;
+  padding: 7px 12px;
+}
+
+.drive-confirm-btn {
+  padding: 7px 12px;
+  font-size: 0.85rem;
+  flex-shrink: 0;
+}
+
 @media (max-width: 768px) {
   .topbar {
     flex-direction: column;
