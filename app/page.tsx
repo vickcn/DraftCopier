@@ -1,12 +1,24 @@
 "use client";
 
+import Script from "next/script";
 import { useEffect, useMemo, useRef, useState } from "react";
+
+declare global {
+  interface Window {
+    gapi?: {
+      load: (library: string, callback: () => void) => void;
+    };
+    google?: any;
+  }
+}
 
 type PreviewPayload = {
   total_records: number;
   headers: string[];
   preview_first_row: string;
   first_row?: Record<string, string>;
+  sheet_names?: string[];
+  selected_sheet?: string;
   cache_id?: string;
   cached_files?: {
     docx_name: string;
@@ -31,6 +43,7 @@ type CachedUpload = {
   docxName: string;
   xlsxName: string;
   font?: string;
+  selectedSheet?: string;
 };
 
 type BatchFailedItem = {
@@ -47,10 +60,41 @@ type BatchSaveResponse = {
   failed_items?: BatchFailedItem[];
 };
 
+type DriveKind = "docx" | "xlsx";
+
+type DriveFile = {
+  id: string;
+  name: string;
+  mime_type: string;
+  modified_time?: string;
+  kind: DriveKind;
+  is_google_workspace: boolean;
+};
+
+type PickerConfig = {
+  enabled: boolean;
+  client_id?: string | null;
+  api_key?: string | null;
+  app_id?: string | null;
+  scope?: string | null;
+  login_hint?: string | null;
+};
+
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "";
 const uploadCacheKey = "draftcopier_upload_cache_v1";
 const userKeyCacheKey = "draftcopier_user_key_v1";
 const userEmailCacheKey = "draftcopier_user_email_v1";
+const pickerMimeTypes: Record<DriveKind, string[]> = {
+  docx: [
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.google-apps.document",
+  ],
+  xlsx: [
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+    "application/vnd.google-apps.spreadsheet",
+  ],
+};
 const fontOptions = [
   { label: "Sans Serif", value: "Sans Serif" },
   { label: "Serif", value: "Serif" },
@@ -122,6 +166,8 @@ function classifyFiles(files: FileList | File[]): DroppedFiles {
 export default function Home() {
   const [docxFile, setDocxFile] = useState<File | null>(null);
   const [xlsxFile, setXlsxFile] = useState<File | null>(null);
+  const [driveDocx, setDriveDocx] = useState<DriveFile | null>(null);
+  const [driveXlsx, setDriveXlsx] = useState<DriveFile | null>(null);
   const [cachedUpload, setCachedUpload] = useState<CachedUpload | null>(null);
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState<UploadState>("idle");
@@ -134,6 +180,15 @@ export default function Home() {
   const [draftFailedItems, setDraftFailedItems] = useState<BatchFailedItem[]>([]);
   const [attachmentsDir, setAttachmentsDir] = useState("");
   const [gmailEmail, setGmailEmail] = useState<string | null>(null);
+  const [selectedSheet, setSelectedSheet] = useState("");
+  const [driveBrowserKind, setDriveBrowserKind] = useState<DriveKind | null>(null);
+  const [driveFiles, setDriveFiles] = useState<DriveFile[]>([]);
+  const [driveQuery, setDriveQuery] = useState("");
+  const [driveLoading, setDriveLoading] = useState(false);
+  const [driveError, setDriveError] = useState<string | null>(null);
+  const [pickerConfig, setPickerConfig] = useState<PickerConfig | null>(null);
+  const [pickerApiReady, setPickerApiReady] = useState(false);
+  const [pickerIdentityReady, setPickerIdentityReady] = useState(false);
 
   const statusLabel: Record<UploadState, string> = {
     idle: "待命",
@@ -145,6 +200,47 @@ export default function Home() {
   const docxInputRef = useRef<HTMLInputElement>(null);
   const xlsxInputRef = useRef<HTMLInputElement>(null);
   const restoreAttemptedRef = useRef<string | null>(null);
+  const pickerTokenRef = useRef<string | null>(null);
+
+  const persistCachedUpload = (nextCached: CachedUpload | null) => {
+    setCachedUpload(nextCached);
+    if (nextCached) {
+      localStorage.setItem(uploadCacheKey, JSON.stringify(nextCached));
+    } else {
+      localStorage.removeItem(uploadCacheKey);
+    }
+  };
+
+  const resetPreparedState = () => {
+    setStatus("idle");
+    setProgress(0);
+    setError(null);
+    setPreview(null);
+    setDraftStatus("idle");
+    setDraftMessage(null);
+    setDraftFailedItems([]);
+    setSelectedSheet("");
+    persistCachedUpload(null);
+    restoreAttemptedRef.current = null;
+  };
+
+  const applyPreviewPayload = (data: PreviewPayload) => {
+    setPreview(data);
+    setSelectedSheet(data.selected_sheet ?? "");
+    if (data.cache_id && data.cached_files) {
+      const nextCached: CachedUpload = {
+        cacheId: data.cache_id,
+        docxName: data.cached_files.docx_name,
+        xlsxName: data.cached_files.xlsx_name,
+        font: selectedFont,
+        selectedSheet: data.selected_sheet,
+      };
+      persistCachedUpload(nextCached);
+      restoreAttemptedRef.current = data.cache_id;
+    }
+    setStatus("done");
+    setProgress(100);
+  };
 
   // 每次載入時，嘗試從 localStorage 還原 session（跨 session 保持登入狀態）
   useEffect(() => {
@@ -212,11 +308,30 @@ export default function Home() {
         if (parsed.font) {
           setSelectedFont(parsed.font);
         }
+        if (parsed.selectedSheet) {
+          setSelectedSheet(parsed.selectedSheet);
+        }
       }
     } catch {
       localStorage.removeItem(uploadCacheKey);
     }
   }, []);
+
+  useEffect(() => {
+    const loadPickerConfig = async () => {
+      try {
+        const response = await fetch(`${apiBase}/api/google/picker/config`, {
+          credentials: "include",
+        });
+        if (!response.ok) return;
+        const data = (await response.json()) as PickerConfig;
+        setPickerConfig(data);
+      } catch {
+        // ignore config load failures; picker stays disabled
+      }
+    };
+    void loadPickerConfig();
+  }, [gmailEmail]);
 
   useEffect(() => {
     const restorePreview = async () => {
@@ -230,6 +345,9 @@ export default function Home() {
         const url = new URL(`${apiBase}/api/process/cache`, window.location.origin);
         url.searchParams.set("cache_id", cachedUpload.cacheId);
         url.searchParams.set("font", cachedUpload.font || selectedFont);
+        if (cachedUpload.selectedSheet) {
+          url.searchParams.set("sheet", cachedUpload.selectedSheet);
+        }
         const response = await fetch(url.toString(), {
           method: "GET",
           credentials: "include",
@@ -245,9 +363,7 @@ export default function Home() {
           return;
         }
         const data = (await response.json()) as PreviewPayload;
-        setPreview(data);
-        setStatus("done");
-        setProgress(100);
+        applyPreviewPayload(data);
       } catch {
         setStatus("idle");
         setProgress(0);
@@ -273,28 +389,155 @@ export default function Home() {
     return missing;
   }, [emailHeader, subjectHeader]);
 
+  const hasDocxSource = !!docxFile || !!driveDocx;
+  const hasXlsxSource = !!xlsxFile || !!driveXlsx;
   const canSubmit = useMemo(
-    () => !!docxFile && !!xlsxFile && status !== "uploading",
-    [docxFile, xlsxFile, status]
+    () => hasDocxSource && hasXlsxSource && status !== "uploading",
+    [hasDocxSource, hasXlsxSource, status]
   );
+
+  const loadDriveFiles = async (kind: DriveKind, query = driveQuery) => {
+    setDriveLoading(true);
+    setDriveError(null);
+    try {
+      const url = new URL(`${apiBase}/api/drive/files`, window.location.origin);
+      url.searchParams.set("kind", kind);
+      if (query.trim()) {
+        url.searchParams.set("q", query.trim());
+      }
+      const response = await fetch(url.toString(), {
+        credentials: "include",
+      });
+      if (response.status === 401) {
+        setDriveFiles([]);
+        setDriveError("請先連結 Gmail，才能讀取雲端硬碟。");
+        return;
+      }
+      if (!response.ok) {
+        setDriveFiles([]);
+        setDriveError("讀取雲端硬碟檔案失敗。");
+        return;
+      }
+      const data = (await response.json()) as { files?: DriveFile[] };
+      setDriveFiles(Array.isArray(data.files) ? data.files : []);
+    } catch {
+      setDriveFiles([]);
+      setDriveError("讀取雲端硬碟檔案時發生錯誤。");
+    } finally {
+      setDriveLoading(false);
+    }
+  };
+
+  const openDriveBrowser = (kind: DriveKind) => {
+    setDriveBrowserKind(kind);
+    setDriveQuery("");
+    void loadDriveFiles(kind, "");
+  };
+
+  const openGooglePicker = (kind: DriveKind) => {
+    if (!gmailEmail) {
+      setError("請先連結 Gmail，再從雲端硬碟挑選檔案。");
+      return;
+    }
+    if (!pickerConfig?.enabled || !pickerConfig.client_id || !pickerConfig.api_key || !pickerConfig.app_id) {
+      setError("Google Picker 尚未設定完成，請補上 API key / client id / app id。");
+      return;
+    }
+    if (!pickerApiReady || !pickerIdentityReady || !window.google?.picker || !window.google?.accounts?.oauth2) {
+      setError("Google Picker 載入中，請稍後再試。");
+      return;
+    }
+
+    const mimeTypes = pickerMimeTypes[kind];
+    const showPicker = (accessToken: string) => {
+      const view = new window.google.picker.DocsView(window.google.picker.ViewId.DOCS);
+      view.setMode(window.google.picker.DocsViewMode.LIST);
+      view.setMimeTypes(mimeTypes.join(","));
+
+      const picker = new window.google.picker.PickerBuilder()
+        .addView(view)
+        .setSelectableMimeTypes(mimeTypes.join(","))
+        .setOAuthToken(accessToken)
+        .setDeveloperKey(pickerConfig.api_key)
+        .setAppId(pickerConfig.app_id)
+        .setOrigin(window.location.origin)
+        .setTitle(kind === "docx" ? "選擇模板" : "選擇收件人清單")
+        .setCallback((data: any) => {
+          if (data[window.google.picker.Response.ACTION] !== window.google.picker.Action.PICKED) {
+            return;
+          }
+          const doc = data[window.google.picker.Response.DOCUMENTS]?.[0];
+          if (!doc) return;
+          const mimeType = String(doc[window.google.picker.Document.MIME_TYPE] ?? "");
+          selectDriveFile(kind, {
+            id: String(doc[window.google.picker.Document.ID] ?? ""),
+            name: String(doc[window.google.picker.Document.NAME] ?? "未命名檔案"),
+            mime_type: mimeType,
+            kind,
+            is_google_workspace: mimeType.startsWith("application/vnd.google-apps."),
+          });
+        })
+        .build();
+
+      picker.setVisible(true);
+    };
+
+    const tokenClient = window.google.accounts.oauth2.initTokenClient({
+      client_id: pickerConfig.client_id,
+      scope: pickerConfig.scope || "https://www.googleapis.com/auth/drive.file",
+      login_hint: pickerConfig.login_hint || gmailEmail || undefined,
+      callback: (response: any) => {
+        if (response?.error || !response?.access_token) {
+          setError("無法取得 Google Picker 存取權杖。");
+          return;
+        }
+        pickerTokenRef.current = response.access_token;
+        showPicker(response.access_token);
+      },
+      error_callback: () => {
+        setError("Google Picker 視窗未完成授權。");
+      },
+    });
+
+    tokenClient.requestAccessToken({
+      prompt: pickerTokenRef.current ? "" : "consent",
+      login_hint: pickerConfig.login_hint || gmailEmail || undefined,
+    });
+  };
+
+  const selectDriveFile = (kind: DriveKind, file: DriveFile) => {
+    resetPreparedState();
+    if (kind === "docx") {
+      setDriveDocx(file);
+      setDocxFile(null);
+      if (docxInputRef.current) docxInputRef.current.value = "";
+    } else {
+      setDriveXlsx(file);
+      setXlsxFile(null);
+      if (xlsxInputRef.current) xlsxInputRef.current.value = "";
+    }
+    setDriveBrowserKind(null);
+  };
 
   const handleDrop = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     setIsDragActive(false);
     const files = classifyFiles(event.dataTransfer.files);
-    if (files.docx) setDocxFile(files.docx);
-    if (files.xlsx) setXlsxFile(files.xlsx);
-    setStatus("idle");
-    setProgress(0);
-    setPreview(null);
-    setDraftStatus("idle");
-    setDraftMessage(null);
-    setDraftFailedItems([]);
+    if (!files.docx && !files.xlsx) return;
+    resetPreparedState();
+    if (files.docx) {
+      setDocxFile(files.docx);
+      setDriveDocx(null);
+    }
+    if (files.xlsx) {
+      setXlsxFile(files.xlsx);
+      setDriveXlsx(null);
+    }
   };
 
   const handleUpload = () => {
-    if (!docxFile || !xlsxFile) {
-      setError("請同時選擇 .docx 與 .xlsx 檔案。");
+    if (!hasDocxSource || !hasXlsxSource) {
+      setError("請同時選擇模板與收件人清單。");
       return;
     }
 
@@ -307,11 +550,22 @@ export default function Home() {
     setDraftFailedItems([]);
 
     const formData = new FormData();
-    formData.append("docx_file", docxFile);
-    formData.append("xlsx_file", xlsxFile);
+    if (docxFile) {
+      formData.append("docx_file", docxFile);
+    } else if (driveDocx) {
+      formData.append("docx_drive_file_id", driveDocx.id);
+    }
+    if (xlsxFile) {
+      formData.append("xlsx_file", xlsxFile);
+    } else if (driveXlsx) {
+      formData.append("xlsx_drive_file_id", driveXlsx.id);
+    }
 
     const url = new URL(`${apiBase}/api/process`, window.location.origin);
     url.searchParams.set("font", selectedFont);
+    if (selectedSheet) {
+      url.searchParams.set("sheet", selectedSheet);
+    }
     const xhr = new XMLHttpRequest();
     xhr.open("POST", url.toString());
     xhr.withCredentials = true;
@@ -327,21 +581,8 @@ export default function Home() {
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           const data = JSON.parse(xhr.responseText) as PreviewPayload;
-          setPreview(data);
-          if (data.cache_id && data.cached_files) {
-            const nextCached: CachedUpload = {
-              cacheId: data.cache_id,
-              docxName: data.cached_files.docx_name,
-              xlsxName: data.cached_files.xlsx_name,
-              font: selectedFont,
-            };
-            setCachedUpload(nextCached);
-            localStorage.setItem(uploadCacheKey, JSON.stringify(nextCached));
-            restoreAttemptedRef.current = data.cache_id;
-          }
-          setStatus("done");
-          setProgress(100);
-        } catch (err) {
+          applyPreviewPayload(data);
+        } catch {
           setStatus("error");
           setError("伺服器回應解析失敗。");
         }
@@ -362,6 +603,8 @@ export default function Home() {
   const resetFiles = () => {
     setDocxFile(null);
     setXlsxFile(null);
+    setDriveDocx(null);
+    setDriveXlsx(null);
     setProgress(0);
     setStatus("idle");
     setError(null);
@@ -369,11 +612,46 @@ export default function Home() {
     setDraftStatus("idle");
     setDraftMessage(null);
     setAttachmentsDir("");
-    setCachedUpload(null);
-    localStorage.removeItem(uploadCacheKey);
+    setSelectedSheet("");
+    persistCachedUpload(null);
     restoreAttemptedRef.current = null;
+    setDriveBrowserKind(null);
+    setDriveFiles([]);
+    setDriveQuery("");
+    setDriveError(null);
     if (docxInputRef.current) docxInputRef.current.value = "";
     if (xlsxInputRef.current) xlsxInputRef.current.value = "";
+  };
+
+  const handleSheetChange = async (nextSheet: string) => {
+    setSelectedSheet(nextSheet);
+    if (!cachedUpload?.cacheId) return;
+
+    setStatus("uploading");
+    setProgress(25);
+    setError(null);
+    try {
+      const url = new URL(`${apiBase}/api/process/cache`, window.location.origin);
+      url.searchParams.set("cache_id", cachedUpload.cacheId);
+      url.searchParams.set("font", selectedFont);
+      if (nextSheet) {
+        url.searchParams.set("sheet", nextSheet);
+      }
+      const response = await fetch(url.toString(), {
+        method: "GET",
+        credentials: "include",
+      });
+      if (!response.ok) {
+        setStatus("error");
+        setError("切換工作表失敗。");
+        return;
+      }
+      const data = (await response.json()) as PreviewPayload;
+      applyPreviewPayload(data);
+    } catch {
+      setStatus("error");
+      setError("切換工作表時發生錯誤。");
+    }
   };
 
   const connectGmail = async () => {
@@ -435,6 +713,9 @@ export default function Home() {
 
       const url = new URL(`${apiBase}/api/drafts/batch`, window.location.origin);
       url.searchParams.set("font", selectedFont);
+      if (selectedSheet) {
+        url.searchParams.set("sheet", selectedSheet);
+      }
       if (attachmentsDir.trim()) {
         url.searchParams.set("attachments_dir", attachmentsDir.trim());
       }
@@ -497,12 +778,26 @@ export default function Home() {
       </header>
 
       <main className="main">
+        <Script
+          src="https://apis.google.com/js/api.js"
+          strategy="afterInteractive"
+          onLoad={() => {
+            window.gapi?.load("picker", () => {
+              setPickerApiReady(true);
+            });
+          }}
+        />
+        <Script
+          src="https://accounts.google.com/gsi/client"
+          strategy="afterInteractive"
+          onLoad={() => setPickerIdentityReady(true)}
+        />
         <section className="hero">
           <div className="hero-text">
             <p className="eyebrow">批次寄信，從模板開始</p>
             <h1>一次完成草稿</h1>
             <p className="lead">
-              上傳 Word 模板與 Excel 清單，系統會轉換樣式、合併欄位，
+              上傳或從雲端硬碟選取 Word 模板與 Excel 清單，系統會轉換樣式、合併欄位，
               並立即顯示第一筆預覽。
             </p>
             <div className="checks">
@@ -544,15 +839,18 @@ export default function Home() {
                     type="file"
                     accept=".docx"
                     onChange={(event) => {
+                      resetPreparedState();
                       setDocxFile(event.target.files?.[0] ?? null);
-                      setStatus("idle");
-                      setProgress(0);
-                      setPreview(null);
-                      setDraftStatus("idle");
-                      setDraftMessage(null);
+                      setDriveDocx(null);
                     }}
                   />
                 </label>
+                <button className="ghost" onClick={() => openGooglePicker("docx")} disabled={!gmailEmail}>
+                  Google Picker 模板
+                </button>
+                <button className="ghost" onClick={() => openDriveBrowser("docx")} disabled={!gmailEmail}>
+                  最近模板
+                </button>
                 <label className="file-btn">
                   選擇 XLSX
                   <input
@@ -560,30 +858,96 @@ export default function Home() {
                     type="file"
                     accept=".xlsx,.xls"
                     onChange={(event) => {
+                      resetPreparedState();
                       setXlsxFile(event.target.files?.[0] ?? null);
-                      setStatus("idle");
-                      setProgress(0);
-                      setPreview(null);
-                      setDraftStatus("idle");
-                      setDraftMessage(null);
+                      setDriveXlsx(null);
                     }}
                   />
                 </label>
+                <button className="ghost" onClick={() => openGooglePicker("xlsx")} disabled={!gmailEmail}>
+                  Google Picker 清單
+                </button>
+                <button className="ghost" onClick={() => openDriveBrowser("xlsx")} disabled={!gmailEmail}>
+                  最近清單
+                </button>
               </div>
             </div>
+
+            {driveBrowserKind && (
+              <div className="drive-browser">
+                <div className="drive-browser-head">
+                  <div>
+                    <p className="drive-browser-title">
+                      選擇{driveBrowserKind === "docx" ? "模板" : "收件人清單"}
+                    </p>
+                    <p className="field-label">
+                      顯示最近 20 筆支援檔案，可搜尋檔名。
+                    </p>
+                  </div>
+                  <button className="ghost" onClick={() => setDriveBrowserKind(null)}>
+                    關閉
+                  </button>
+                </div>
+                <div className="drive-browser-search">
+                  <input
+                    className="text-input"
+                    type="text"
+                    placeholder="輸入檔名關鍵字"
+                    value={driveQuery}
+                    onChange={(event) => setDriveQuery(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void loadDriveFiles(driveBrowserKind, driveQuery);
+                      }
+                    }}
+                  />
+                  <button className="ghost" onClick={() => void loadDriveFiles(driveBrowserKind, driveQuery)}>
+                    搜尋
+                  </button>
+                </div>
+                {driveError && <p className="error">{driveError}</p>}
+                <div className="drive-file-list">
+                  {driveLoading ? (
+                    <p className="field-label">讀取中...</p>
+                  ) : driveFiles.length > 0 ? (
+                    driveFiles.map((file) => (
+                      <button
+                        key={file.id}
+                        className="drive-file-item"
+                        onClick={() => selectDriveFile(driveBrowserKind, file)}
+                      >
+                        <span className="drive-file-name">{file.name}</span>
+                        <span className="field-label">
+                          {file.is_google_workspace ? "Google 工作區" : "Office 檔案"}
+                        </span>
+                      </button>
+                    ))
+                  ) : (
+                    <p className="field-label">找不到可用檔案。</p>
+                  )}
+                </div>
+              </div>
+            )}
 
             <div className="file-grid">
               <div className="file-tile">
                 <p className="file-label">模板</p>
                 <p className="file-name">
-                  {docxFile ? docxFile.name : cachedUpload?.docxName ?? "尚未選擇 DOCX"}
+                  {docxFile
+                    ? docxFile.name
+                    : driveDocx?.name ?? cachedUpload?.docxName ?? "尚未選擇 DOCX"}
                 </p>
+                <p className="file-source">{docxFile ? "本機檔案" : driveDocx ? "雲端硬碟" : "未選擇"}</p>
               </div>
               <div className="file-tile">
                 <p className="file-label">收件人清單</p>
                 <p className="file-name">
-                  {xlsxFile ? xlsxFile.name : cachedUpload?.xlsxName ?? "尚未選擇 XLSX"}
+                  {xlsxFile
+                    ? xlsxFile.name
+                    : driveXlsx?.name ?? cachedUpload?.xlsxName ?? "尚未選擇 XLSX"}
                 </p>
+                <p className="file-source">{xlsxFile ? "本機檔案" : driveXlsx ? "雲端硬碟" : "未選擇"}</p>
               </div>
             </div>
 
@@ -604,6 +968,27 @@ export default function Home() {
                 ))}
               </select>
             </div>
+
+            {preview?.sheet_names && preview.sheet_names.length > 0 && (
+              <div className="field">
+                <label className="field-label" htmlFor="sheet-select">
+                  收件人工作表
+                </label>
+                <select
+                  id="sheet-select"
+                  className="font-select"
+                  value={selectedSheet}
+                  onChange={(event) => void handleSheetChange(event.target.value)}
+                  disabled={!cachedUpload?.cacheId || status === "uploading"}
+                >
+                  {preview.sheet_names.map((sheetName) => (
+                    <option key={sheetName} value={sheetName}>
+                      {sheetName}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
 
             <div className="field">
               <label className="field-label" htmlFor="attachments-dir">
@@ -695,6 +1080,7 @@ export default function Home() {
             </div>
             {preview && (
               <div className="preview-meta">
+                <span>工作表：{preview.selected_sheet ?? "未指定"}</span>
                 <span>總筆數：{preview.total_records}</span>
                 <span>欄位：{preview.headers.join("、")}</span>
               </div>
