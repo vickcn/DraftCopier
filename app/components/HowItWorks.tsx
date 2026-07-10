@@ -135,7 +135,12 @@ export default function HowItWorks({ speed = 1, primary, accent }: Props) {
 
     const fit = () => {
       const w = scaler.clientWidth;
-      const s = Math.min(1, w / 1080);
+      const viewportW = window.innerWidth;
+      const viewportH = window.innerHeight;
+      const widthScale = w / 1080;
+      const heightReserve = viewportW <= 480 ? 240 : viewportW <= 720 ? 220 : 170;
+      const heightScale = Math.max(0.45, (viewportH - heightReserve) / 660);
+      const s = Math.min(1, widthScale, heightScale);
       scaleRef.current = s;
       stage.style.transform = `scale(${s})`;
       scaler.style.height = `${660 * s}px`;
