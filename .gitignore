@@ -22,6 +22,9 @@ wheels/
 MANIFEST
 *.*workspace
 *.env*
+**.zip
+tests
+
 
 # PyInstaller
 *.manifest

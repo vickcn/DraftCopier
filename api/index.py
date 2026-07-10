@@ -1,20 +1,26 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, Response
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
 import pandas as pd
 from datetime import date, datetime
 from pathlib import Path
 import mimetypes
+import json
 import re
 import traceback
 import io
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from api.core.processor import convert_docx_to_html, inject_variables, resolve_gmail_font
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from api.core.processor import (
+    export_html_to_docx_bytes,
+    inject_variables,
+    resolve_gmail_font,
+    resolve_template_html,
+)
 from api.core.gmail_svc import (
     create_draft,
     exchange_code_for_token,
@@ -134,6 +140,8 @@ class DraftRequest(BaseModel):
     to: str
     subject: str
     body_html: str
+    cc: str | None = None
+    bcc: str | None = None
 
 EMAIL_FIELD_CANDIDATES = {
     "email",
@@ -145,6 +153,22 @@ EMAIL_FIELD_CANDIDATES = {
     "信箱",
     "收件人",
     "收件人信箱",
+}
+
+CC_FIELD_CANDIDATES = {
+    "cc",
+    "copy",
+    "carbon copy",
+    "抄送",
+    "副本",
+    "副本收件人",
+}
+
+BCC_FIELD_CANDIDATES = {
+    "bcc",
+    "blind carbon copy",
+    "密件副本",
+    "秘密副本",
 }
 
 SUBJECT_FIELD_CANDIDATES = {
@@ -169,9 +193,12 @@ ATTACHMENTS_ROOTS = [
 UPLOAD_CACHE_DIR = Path(os.environ.get("UPLOAD_CACHE_DIR", "/tmp/draftcopier_uploads")).resolve()
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet"
+GOOGLE_SLIDE_MIME = "application/vnd.google-apps.presentation"
+GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 XLS_MIME = "application/vnd.ms-excel"
+PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 DRIVE_FILE_KINDS = {
     "docx": {
         "mime_types": {DOCX_MIME, GOOGLE_DOC_MIME},
@@ -182,6 +209,17 @@ DRIVE_FILE_KINDS = {
         "mime_types": {XLSX_MIME, XLS_MIME, GOOGLE_SHEET_MIME},
         "export_mime": XLSX_MIME,
         "extension": ".xlsx",
+    },
+    "attachment": {
+        "blocked_mime_types": {GOOGLE_FOLDER_MIME},
+        "workspace_export": {
+            GOOGLE_DOC_MIME: {"mime_type": DOCX_MIME, "extension": ".docx"},
+            GOOGLE_SHEET_MIME: {"mime_type": XLSX_MIME, "extension": ".xlsx"},
+            GOOGLE_SLIDE_MIME: {"mime_type": PPTX_MIME, "extension": ".pptx"},
+        },
+    },
+    "folder": {
+        "mime_types": {GOOGLE_FOLDER_MIME},
     },
 }
 
@@ -210,6 +248,19 @@ def _find_attachment_headers(headers: list[object]) -> list[object]:
         if name.startswith(ATTACHMENT_HEADER_PREFIX):
             matched.append(header)
     return matched
+
+
+def _normalize_email_list(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    parts = [p.strip() for p in re.split(r"[;,\n]+", text)]
+    normalized = [p for p in parts if p]
+    return ", ".join(normalized) if normalized else None
 
 
 def _split_attachment_names(value: object) -> list[str]:
@@ -325,44 +376,72 @@ def _read_upload_cache(*, namespace: str, cache_id: str) -> dict[str, bytes | st
 
 def _build_preview_payload(
     *,
-    docx_content: bytes,
+    docx_content: bytes | None,
+    template_html: str | None,
     xlsx_content: bytes,
     sheet: str | None,
     font: str | None,
     cache_info: dict[str, str] | None,
+    preview_page: int,
+    preview_page_size: int,
 ) -> dict:
     font_family = resolve_gmail_font(font)
-    html_template = convert_docx_to_html(docx_content, base_font_family=font_family)
+    html_template = resolve_template_html(
+        docx_content=docx_content,
+        template_html=template_html,
+        base_font_family=font_family,
+    )
 
     df, sheet_names, selected_sheet = _read_recipient_sheet(xlsx_content, sheet)
 
+    def serialize_row(row: dict) -> dict[str, str]:
+        serialized: dict[str, str] = {}
+        for key, value in row.items():
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                serialized[str(key)] = ""
+            elif isinstance(value, (datetime, date, pd.Timestamp)):
+                serialized[str(key)] = value.isoformat()
+            else:
+                serialized[str(key)] = str(value)
+        return serialized
+
     rows = df.to_dict(orient="records")
     attachment_headers = [str(h) for h in _find_attachment_headers(list(df.columns))]
+    total_records = len(rows)
+    page_size = max(1, min(preview_page_size, 200))
+    total_pages = max(1, (total_records + page_size - 1) // page_size) if total_records else 1
+    page = max(1, min(preview_page, total_pages))
+    page_start = (page - 1) * page_size
+    page_end = page_start + page_size
 
     preview = ""
     first_row: dict[str, str] = {}
     if rows:
         preview = inject_variables(html_template, rows[0])
-        for key, value in rows[0].items():
-            if value is None or (isinstance(value, float) and pd.isna(value)):
-                first_row[str(key)] = ""
-            elif isinstance(value, (datetime, date, pd.Timestamp)):
-                first_row[str(key)] = value.isoformat()
-            else:
-                first_row[str(key)] = str(value)
+        first_row = serialize_row(rows[0])
 
     email_header = _find_header(list(df.columns), EMAIL_FIELD_CANDIDATES)
+    cc_header = _find_header(list(df.columns), CC_FIELD_CANDIDATES)
+    bcc_header = _find_header(list(df.columns), BCC_FIELD_CANDIDATES)
     subject_header = _find_header(list(df.columns), SUBJECT_FIELD_CANDIDATES)
-
     payload = {
-        "total_records": len(rows),
+        "total_records": total_records,
         "headers": list(df.columns),
         "preview_first_row": preview,
+        "template_html": html_template,
         "first_row": first_row,
+        "preview_rows": [serialize_row(row) for row in rows[page_start:page_end]],
+        "preview_pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        },
         "sheet_names": sheet_names,
         "selected_sheet": selected_sheet,
         "detected_fields": {
             "email": email_header,
+            "cc": cc_header,
+            "bcc": bcc_header,
             "subject": subject_header,
             "attachments": attachment_headers,
         },
@@ -376,7 +455,13 @@ def _build_preview_payload(
     return payload
 
 
-def get_attachment_content(file_path: str, credentials: Credentials) -> dict[str, str | bytes]:
+def get_attachment_content(
+    file_path: str,
+    credentials: Credentials,
+    *,
+    drive_service=None,
+    parent_folder_id: str | None = None,
+) -> dict[str, str | bytes]:
     """
     Google Drive fallback：依檔名從 Drive 查詢並下載。
     本地檔案解析須透過 _resolve_attachment_from_disk（含根目錄驗證），不在此處理。
@@ -385,15 +470,27 @@ def get_attachment_content(file_path: str, credentials: Credentials) -> dict[str
     if not filename:
         raise FileNotFoundError(f"Invalid attachment path: {file_path!r}")
 
-    drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+    if drive_service is None:
+        drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
     query_name = filename.replace("'", "\\'")
-    query = f"name='{query_name}' and trashed=false"
+    clauses = [f"name='{query_name}'", "trashed=false"]
+    if parent_folder_id:
+        safe_parent = parent_folder_id.replace("'", "\\'")
+        clauses.append(f"'{safe_parent}' in parents")
+    query = " and ".join(clauses)
     results = drive_service.files().list(
         q=query,
         fields="files(id,name,mimeType)",
         pageSize=1,
     ).execute()
     items = results.get("files", [])
+    if not items and parent_folder_id:
+        return get_attachment_content(
+            file_path,
+            credentials,
+            drive_service=drive_service,
+            parent_folder_id=None,
+        )
     if not items:
         raise FileNotFoundError(f"Attachment not found on disk or Google Drive: {filename}")
 
@@ -445,6 +542,19 @@ def _get_drive_kind_config(kind: str) -> dict[str, object]:
     return config
 
 
+def _kind_allows_mime_type(kind: str, mime_type: str) -> bool:
+    config = _get_drive_kind_config(kind)
+    if "mime_types" in config:
+        return mime_type in config["mime_types"]  # type: ignore[operator]
+    blocked = config.get("blocked_mime_types", set())
+    if mime_type in blocked:  # type: ignore[operator]
+        return False
+    if mime_type.startswith("application/vnd.google-apps."):
+        workspace_export = config.get("workspace_export", {})
+        return mime_type in workspace_export  # type: ignore[operator]
+    return True
+
+
 def _derive_google_app_id(client_id: str | None) -> str | None:
     if not client_id:
         return None
@@ -454,10 +564,15 @@ def _derive_google_app_id(client_id: str | None) -> str | None:
 
 def _drive_query_for_kind(kind: str, query: str | None) -> str:
     config = _get_drive_kind_config(kind)
-    mime_filters = " or ".join(
-        f"mimeType='{mime}'" for mime in sorted(config["mime_types"])  # type: ignore[index]
-    )
-    clauses = [f"({mime_filters})", "trashed=false"]
+    if "mime_types" in config:
+        mime_filters = " or ".join(
+            f"mimeType='{mime}'" for mime in sorted(config["mime_types"])  # type: ignore[index]
+        )
+        clauses = [f"({mime_filters})", "trashed=false"]
+    else:
+        blocked = sorted(config.get("blocked_mime_types", set()))  # type: ignore[arg-type]
+        clauses = [f"mimeType!='{mime}'" for mime in blocked]
+        clauses.append("trashed=false")
     if query:
         safe_query = query.replace("\\", "\\\\").replace("'", "\\'")
         clauses.append(f"name contains '{safe_query}'")
@@ -476,14 +591,30 @@ def _download_drive_file(
         fields="id,name,mimeType,modifiedTime",
     ).execute()
     mime_type = str(metadata.get("mimeType") or "")
-    if mime_type not in config["mime_types"]:  # type: ignore[operator]
+    if not _kind_allows_mime_type(kind, mime_type):
         raise HTTPException(
             status_code=400,
             detail={"error": "unsupported_drive_file", "file_id": file_id, "mime_type": mime_type},
         )
 
-    filename = str(metadata.get("name") or f"{kind}{config['extension']}")
-    if mime_type.startswith("application/vnd.google-apps."):
+    filename = str(metadata.get("name") or f"{kind}{config.get('extension', '')}")
+    if kind == "attachment" and mime_type.startswith("application/vnd.google-apps."):
+        workspace_export = config.get("workspace_export", {})
+        export_config = workspace_export.get(mime_type)  # type: ignore[assignment]
+        if not export_config:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "unsupported_drive_file", "file_id": file_id, "mime_type": mime_type},
+            )
+        extension = str(export_config["extension"])
+        if not filename.lower().endswith(extension):
+            filename = f"{filename}{extension}"
+        request = drive_service.files().export_media(
+            fileId=file_id,
+            mimeType=str(export_config["mime_type"]),
+        )
+        output_mime = str(export_config["mime_type"])
+    elif mime_type.startswith("application/vnd.google-apps."):
         if not filename.lower().endswith(str(config["extension"])):
             filename = f"{filename}{config['extension']}"
         request = drive_service.files().export_media(
@@ -507,6 +638,59 @@ def _download_drive_file(
         "mime_type": output_mime,
         "content": buffer.getvalue(),
     }
+
+
+def _parse_attachment_drive_file_ids(raw: str | None) -> list[str]:
+    if raw is None or not raw.strip():
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_attachment_drive_file_ids", "message": str(exc)},
+        ) from exc
+    if not isinstance(parsed, list) or not all(isinstance(item, str) and item.strip() for item in parsed):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_attachment_drive_file_ids", "message": "Expected a JSON array of file ids."},
+        )
+    return [item.strip() for item in parsed]
+
+
+def _load_selected_drive_attachments(
+    drive_service,
+    file_ids: list[str],
+) -> dict[str, dict[str, str | bytes]]:
+    selected: dict[str, dict[str, str | bytes]] = {}
+    for file_id in file_ids:
+        downloaded = _download_drive_file(drive_service, file_id=file_id, kind="attachment")
+        filename = str(downloaded["name"])
+        attachment = {
+            "filename": filename,
+            "content": downloaded["content"],
+            "mime_type": str(downloaded["mime_type"]),
+        }
+        selected[filename] = attachment
+        selected[Path(filename).name] = attachment
+    return selected
+
+
+async def _load_uploaded_local_attachments(
+    upload_files: list[UploadFile] | None,
+) -> dict[str, dict[str, str | bytes]]:
+    selected: dict[str, dict[str, str | bytes]] = {}
+    for upload_file in upload_files or []:
+        filename = upload_file.filename or "attachment"
+        content = await upload_file.read()
+        attachment = {
+            "filename": filename,
+            "content": content,
+            "mime_type": upload_file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+        }
+        selected[filename] = attachment
+        selected[Path(filename).name] = attachment
+    return selected
 
 
 async def _read_input_source(
@@ -542,7 +726,8 @@ def _require_session_user_key(request: Request) -> str:
 def session_info(request: Request):
     user_key = request.session.get("user_key")
     email = request.session.get("user_email")
-    return {"user_key": user_key, "email": email}
+    name = request.session.get("user_name")
+    return {"user_key": user_key, "email": email, "name": name}
 
 
 def _fetch_gmail_email(creds: Credentials) -> str | None:
@@ -552,6 +737,20 @@ def _fetch_gmail_email(creds: Credentials) -> str | None:
         return profile.get("emailAddress")
     except Exception:
         return None
+
+
+def _fetch_google_profile(creds: Credentials) -> dict[str, str | None]:
+    profile: dict[str, str | None] = {"email": None, "name": None}
+    try:
+        service = build("oauth2", "v2", credentials=creds, cache_discovery=False)
+        userinfo = service.userinfo().get().execute()
+        email = userinfo.get("email")
+        name = userinfo.get("name")
+        profile["email"] = str(email) if email else None
+        profile["name"] = str(name) if name else None
+    except Exception:
+        profile["email"] = _fetch_gmail_email(creds)
+    return profile
 
 
 class RestoreSessionRequest(BaseModel):
@@ -566,13 +765,18 @@ def session_restore(request: Request, body: RestoreSessionRequest):
         creds = load_user_credentials(body.user_key)
         request.session["user_key"] = body.user_key
         email = request.session.get("user_email")
-        if not email:
-            email = _fetch_gmail_email(creds)
+        name = request.session.get("user_name")
+        if not email or not name:
+            profile = _fetch_google_profile(creds)
+            email = email or profile.get("email")
+            name = name or profile.get("name")
             if email:
                 request.session["user_email"] = email
-        return {"ok": True, "restored": True, "email": email}
+            if name:
+                request.session["user_name"] = name
+        return {"ok": True, "restored": True, "email": email, "name": name}
     except Exception:
-        return {"ok": True, "restored": False, "email": None}
+        return {"ok": True, "restored": False, "email": None, "name": None}
 
 
 @app.get("/api/auth/google")
@@ -613,9 +817,13 @@ def google_auth_callback(request: Request, code: str, state: str):
         code_verifier = request.session.get("oauth_code_verifier")
         
         creds = exchange_code_for_token(code=code, state=state, user_key=user_key, code_verifier=code_verifier)
-        email = _fetch_gmail_email(creds)
+        profile = _fetch_google_profile(creds)
+        email = profile.get("email")
+        name = profile.get("name")
         if email:
             request.session["user_email"] = email
+        if name:
+            request.session["user_name"] = name
 
         request.session.pop("oauth_state", None)
         request.session.pop("oauth_user_key", None)
@@ -660,7 +868,7 @@ def list_drive_files(
         items = []
         for file in response.get("files", []):
             mime_type = str(file.get("mimeType") or "")
-            if mime_type not in config["mime_types"]:  # type: ignore[operator]
+            if not _kind_allows_mime_type(kind, mime_type):
                 continue
             items.append(
                 {
@@ -694,6 +902,87 @@ def google_picker_config(request: Request):
         "login_hint": request.session.get("user_email"),
     }
 
+
+class DriveFolderCreateRequest(BaseModel):
+    parent_folder_id: str | None = None
+    folder_name: str | None = None
+
+
+@app.post("/api/drive/folders/create")
+def create_drive_folder(request: Request, payload: DriveFolderCreateRequest):
+    try:
+        user_key = _require_session_user_key(request)
+        creds = load_user_credentials(user_key)
+        drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        folder_name = (payload.folder_name or "").strip() or f"DraftCopier Attachments {datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        body: dict[str, object] = {
+            "name": folder_name,
+            "mimeType": GOOGLE_FOLDER_MIME,
+        }
+        if payload.parent_folder_id:
+            body["parents"] = [payload.parent_folder_id]
+        folder = drive_service.files().create(
+            body=body,
+            fields="id,name,mimeType,modifiedTime",
+        ).execute()
+        return {
+            "folder": {
+                "id": folder.get("id"),
+                "name": folder.get("name"),
+                "mime_type": folder.get("mimeType"),
+                "modified_time": folder.get("modifiedTime"),
+                "kind": "folder",
+                "is_google_workspace": True,
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/drive/folders/upload")
+async def upload_files_to_drive_folder(
+    request: Request,
+    folder_id: str = Form(...),
+    files: list[UploadFile] | None = File(None),
+):
+    try:
+        if not files:
+            raise HTTPException(status_code=400, detail={"error": "missing_files"})
+        user_key = _require_session_user_key(request)
+        creds = load_user_credentials(user_key)
+        drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        uploaded_items: list[dict[str, object]] = []
+        for upload_file in files:
+            filename = upload_file.filename or "attachment"
+            content = await upload_file.read()
+            media = MediaIoBaseUpload(
+                io.BytesIO(content),
+                mimetype=upload_file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+                resumable=False,
+            )
+            file = drive_service.files().create(
+                body={"name": filename, "parents": [folder_id]},
+                media_body=media,
+                fields="id,name,mimeType,modifiedTime",
+            ).execute()
+            uploaded_items.append(
+                {
+                    "id": file.get("id"),
+                    "name": file.get("name"),
+                    "mime_type": file.get("mimeType"),
+                    "modified_time": file.get("modifiedTime"),
+                    "kind": "attachment",
+                    "is_google_workspace": False,
+                }
+            )
+        return {"files": uploaded_items}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/drafts")
 def create_draft_route(request: Request, payload: DraftRequest):
     try:
@@ -704,6 +993,8 @@ def create_draft_route(request: Request, payload: DraftRequest):
             to=payload.to,
             subject=payload.subject,
             body_html=payload.body_html,
+            cc=payload.cc,
+            bcc=payload.bcc,
         )
         return {"status": "ok", "draft": draft}
     except HTTPException:
@@ -717,6 +1008,12 @@ async def create_drafts_batch(
     docx_file: UploadFile | None = File(None),
     xlsx_file: UploadFile | None = File(None),
     cache_id: str | None = Form(None),
+    docx_drive_file_id: str | None = Form(None),
+    xlsx_drive_file_id: str | None = Form(None),
+    template_html: str | None = Form(None),
+    attachment_drive_file_ids_json: str | None = Form(None),
+    attachment_drive_folder_id: str | None = Form(None),
+    attachment_local_files: list[UploadFile] | None = File(None),
     sheet: str | None = None,
     font: str | None = None,
     attachments_dir: str | None = None,
@@ -725,6 +1022,14 @@ async def create_drafts_batch(
         user_key = _require_session_user_key(request)
         creds = load_user_credentials(user_key)
         cache_namespace = _get_upload_cache_namespace(request)
+        attachment_drive_file_ids = _parse_attachment_drive_file_ids(attachment_drive_file_ids_json)
+        selected_drive_attachments: dict[str, dict[str, str | bytes]] = {}
+        selected_local_attachments = await _load_uploaded_local_attachments(attachment_local_files)
+
+        docx_content: bytes | None = None
+        drive_service_for_inputs = None
+        if docx_drive_file_id or xlsx_drive_file_id:
+            drive_service_for_inputs = build("drive", "v3", credentials=creds, cache_discovery=False)
 
         if docx_file and xlsx_file:
             docx_content = await docx_file.read()
@@ -735,17 +1040,42 @@ async def create_drafts_batch(
             xlsx_content = cached["xlsx_content"]
             if not isinstance(docx_content, bytes) or not isinstance(xlsx_content, bytes):
                 raise HTTPException(status_code=500, detail={"error": "invalid_cache_payload"})
+        elif xlsx_file and template_html:
+            xlsx_content = await xlsx_file.read()
+        elif xlsx_drive_file_id and template_html:
+            _, xlsx_content = await _read_input_source(
+                kind="xlsx",
+                upload_file=None,
+                drive_file_id=xlsx_drive_file_id,
+                drive_service=drive_service_for_inputs,
+            )
+            if docx_drive_file_id:
+                _, docx_content = await _read_input_source(
+                    kind="docx",
+                    upload_file=None,
+                    drive_file_id=docx_drive_file_id,
+                    drive_service=drive_service_for_inputs,
+                )
         else:
             raise HTTPException(
                 status_code=400,
-                detail={"error": "missing_upload_source", "message": "Need docx/xlsx files or cache_id."},
+                detail={
+                    "error": "missing_upload_source",
+                    "message": "Need cache_id, docx/xlsx files, or xlsx source with template_html.",
+                },
             )
 
         font_family = resolve_gmail_font(font)
-        html_template = convert_docx_to_html(docx_content, base_font_family=font_family)
+        html_template = resolve_template_html(
+            docx_content=docx_content,
+            template_html=template_html,
+            base_font_family=font_family,
+        )
         df, _, _ = _read_recipient_sheet(xlsx_content, sheet)
 
         email_header = _find_header(list(df.columns), EMAIL_FIELD_CANDIDATES)
+        cc_header = _find_header(list(df.columns), CC_FIELD_CANDIDATES)
+        bcc_header = _find_header(list(df.columns), BCC_FIELD_CANDIDATES)
         subject_header = _find_header(list(df.columns), SUBJECT_FIELD_CANDIDATES)
         # attachment_headers = [str(h) for h in _find_attachment_headers(list(df.columns))]
         missing_headers = []
@@ -766,6 +1096,11 @@ async def create_drafts_batch(
         failed_items: list[dict[str, object]] = []
         attachment_headers_raw = _find_attachment_headers(list(df.columns))
         base_dir = Path(attachments_dir).expanduser().resolve() if attachments_dir else ATTACHMENTS_DIR
+        drive_service = None
+        if attachment_drive_file_ids or attachment_drive_folder_id:
+            drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        if attachment_drive_file_ids:
+            selected_drive_attachments = _load_selected_drive_attachments(drive_service, attachment_drive_file_ids)
         
         print(f"[DEBUG] Excel 欄位列表: {list(df.columns)}")
         print(f"[DEBUG] 偵測到的附件欄位 (attachment_headers_raw): {attachment_headers_raw}")
@@ -779,6 +1114,8 @@ async def create_drafts_batch(
 
         for idx, row in enumerate(rows, start=1):
             to_value = row.get(email_header)
+            cc_value = _normalize_email_list(row.get(cc_header)) if cc_header else None
+            bcc_value = _normalize_email_list(row.get(bcc_header)) if bcc_header else None
             subject_value = row.get(subject_header)
             can_send = True
             if _is_empty_cell(to_value):
@@ -796,23 +1133,33 @@ async def create_drafts_batch(
                     print(f"[attachments] row {idx} header={header!r} type={type(value)} value={value!r}")
                 for name in _split_attachment_names(value):
                     resolved: dict[str, str | bytes] | None = None
+                    selected_attachment = selected_drive_attachments.get(name) or selected_drive_attachments.get(Path(name).name)
+                    if selected_attachment:
+                        resolved = selected_attachment
+                    if not resolved:
+                        resolved = selected_local_attachments.get(name) or selected_local_attachments.get(Path(name).name)
                     name_path = Path(name)
                     should_try_local = name_path.is_absolute() or base_dir.exists()
-                    if should_try_local:
+                    if not resolved and should_try_local:
                         resolved = _resolve_attachment_from_disk(
                             name=name,
                             base_dir=base_dir,
                             allow_absolute=ALLOW_ABSOLUTE_ATTACHMENTS,
                             roots=ATTACHMENTS_ROOTS,
                         )
-                    elif idx <= 3:
+                    elif not resolved and idx <= 3:
                         print(
                             f"[attachments] base_dir 不存在，略過本地相對路徑，改用 Drive 查詢: row={idx} name={name!r}"
                         )
                     if not resolved:
                         print(f"[attachments] Drive fallback lookup: row={idx} name={name!r}")
                         try:
-                            resolved = get_attachment_content(name, creds)
+                            resolved = get_attachment_content(
+                                name,
+                                creds,
+                                drive_service=drive_service,
+                                parent_folder_id=attachment_drive_folder_id,
+                            )
                             if idx <= 3:
                                 print(
                                     f"[attachments] Drive fallback success: row={idx} name={name!r} resolved={resolved.get('filename')!r}"
@@ -841,9 +1188,11 @@ async def create_drafts_batch(
             try:
                 draft = create_draft(
                     creds=creds,
-                    to=str(to_value).strip(),
+                    to=_normalize_email_list(to_value) or str(to_value).strip(),
                     subject=str(subject_value).strip(),
                     body_html=body_html,
+                    cc=cc_value,
+                    bcc=bcc_value,
                     attachments=row_attachments[idx - 1],
                 )
                 drafts.append(draft.get("id"))
@@ -872,6 +1221,8 @@ def process_cached_preview(
     cache_id: str,
     sheet: str | None = None,
     font: str | None = None,
+    preview_page: int = 1,
+    preview_page_size: int = 20,
 ):
     try:
         cache_namespace = _get_upload_cache_namespace(request)
@@ -887,10 +1238,13 @@ def process_cached_preview(
         }
         return _build_preview_payload(
             docx_content=docx_content,
+            template_html=None,
             xlsx_content=xlsx_content,
             sheet=sheet,
             font=font,
             cache_info=cache_info,
+            preview_page=preview_page,
+            preview_page_size=preview_page_size,
         )
     except HTTPException:
         raise
@@ -898,20 +1252,22 @@ def process_cached_preview(
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-@app.post("/api/process")
-async def process_files(
+
+class TemplateExportRequest(BaseModel):
+    template_html: str
+    filename: str | None = None
+
+
+@app.post("/api/template/load")
+async def load_template_from_docx(
     request: Request,
     docx_file: UploadFile | None = File(None),
-    xlsx_file: UploadFile | None = File(None),
     docx_drive_file_id: str | None = Form(None),
-    xlsx_drive_file_id: str | None = Form(None),
-    sheet: str | None = None,
     font: str | None = None,
 ):
     try:
-        cache_namespace = _get_upload_cache_namespace(request)
         drive_service = None
-        if docx_drive_file_id or xlsx_drive_file_id:
+        if docx_drive_file_id:
             user_key = _require_session_user_key(request)
             creds = load_user_credentials(user_key)
             drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
@@ -922,26 +1278,88 @@ async def process_files(
             drive_file_id=docx_drive_file_id,
             drive_service=drive_service,
         )
+        font_family = resolve_gmail_font(font)
+        template_html = resolve_template_html(
+            docx_content=docx_content,
+            template_html=None,
+            base_font_family=font_family,
+        )
+        return {"docx_name": docx_name, "template_html": template_html}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/template/export")
+def export_template_docx(payload: TemplateExportRequest):
+    try:
+        filename = (payload.filename or "template").strip() or "template"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._") or "template"
+        if not safe_name.lower().endswith(".docx"):
+            safe_name = f"{safe_name}.docx"
+        content = export_html_to_docx_bytes(payload.template_html)
+        return Response(
+            content=content,
+            media_type=DOCX_MIME,
+            headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/process")
+async def process_files(
+    request: Request,
+    docx_file: UploadFile | None = File(None),
+    xlsx_file: UploadFile | None = File(None),
+    docx_drive_file_id: str | None = Form(None),
+    xlsx_drive_file_id: str | None = Form(None),
+    template_html: str | None = Form(None),
+    sheet: str | None = None,
+    font: str | None = None,
+    preview_page: int = 1,
+    preview_page_size: int = 20,
+):
+    try:
+        cache_namespace = _get_upload_cache_namespace(request)
+        drive_service = None
+        if docx_drive_file_id or xlsx_drive_file_id:
+            user_key = _require_session_user_key(request)
+            creds = load_user_credentials(user_key)
+            drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+
         xlsx_name, xlsx_content = await _read_input_source(
             kind="xlsx",
             upload_file=xlsx_file,
             drive_file_id=xlsx_drive_file_id,
             drive_service=drive_service,
         )
-        cache_info = _write_upload_cache(
-            namespace=cache_namespace,
-            docx_name=docx_name,
-            docx_content=docx_content,
-            xlsx_name=xlsx_name,
-            xlsx_content=xlsx_content,
-        )
-        request.session["latest_cache_id"] = cache_info["cache_id"]
+        docx_content: bytes | None = None
+        cache_info: dict[str, str] | None = None
+        if docx_file or docx_drive_file_id:
+            docx_name, docx_content = await _read_input_source(
+                kind="docx",
+                upload_file=docx_file,
+                drive_file_id=docx_drive_file_id,
+                drive_service=drive_service,
+            )
+            cache_info = _write_upload_cache(
+                namespace=cache_namespace,
+                docx_name=docx_name,
+                docx_content=docx_content,
+                xlsx_name=xlsx_name,
+                xlsx_content=xlsx_content,
+            )
+            request.session["latest_cache_id"] = cache_info["cache_id"]
         return _build_preview_payload(
             docx_content=docx_content,
+            template_html=template_html,
             xlsx_content=xlsx_content,
             sheet=sheet,
             font=font,
             cache_info=cache_info,
+            preview_page=preview_page,
+            preview_page_size=preview_page_size,
         )
     except Exception as e:
         traceback.print_exc()

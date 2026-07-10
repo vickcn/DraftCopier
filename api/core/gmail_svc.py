@@ -17,7 +17,11 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
 DEFAULT_SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
@@ -192,6 +196,8 @@ def create_draft(
         to: str,
         subject: str,
         body_html: str,
+        cc: str | None = None,
+        bcc: str | None = None,
         attachments: Optional[Sequence[dict[str, str | bytes]]] = None,
     ) -> dict:
     """
@@ -206,10 +212,16 @@ def create_draft(
     Returns:
         Gmail API response payload for the created draft.
     """
+    def _set_optional_header(message, header_name: str, value: str | None) -> None:
+        if value and value.strip():
+            message[header_name] = value.strip()
+
     if attachments:
         message = MIMEMultipart()
         message["to"] = to
         message["subject"] = subject
+        _set_optional_header(message, "cc", cc)
+        _set_optional_header(message, "bcc", bcc)
         message.attach(MIMEText(body_html, "html", "utf-8"))
 
         for attachment in attachments:
@@ -234,6 +246,8 @@ def create_draft(
         message = MIMEText(body_html, "html", "utf-8")
         message["to"] = to
         message["subject"] = subject
+        _set_optional_header(message, "cc", cc)
+        _set_optional_header(message, "bcc", bcc)
 
     encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
     body = {"message": {"raw": encoded_message}}

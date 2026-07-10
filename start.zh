@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [ -f "$ROOT_DIR/.env" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+if [ -f "$HOME/tchop/bin/activate" ]; then
+  # shellcheck disable=SC1091
+  source "$HOME/tchop/bin/activate"
+fi
+
+cleanup() {
+  jobs -pr | xargs -r kill
+}
+trap cleanup EXIT INT TERM
+
+stop_port() {
+  local port="$1"
+  local pids
+  pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN || true)"
+  if [ -n "$pids" ]; then
+    kill $pids || true
+    sleep 1
+    pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN || true)"
+    if [ -n "$pids" ]; then
+      kill -9 $pids || true
+    fi
+  fi
+}
+
+cd "$ROOT_DIR"
+
+stop_port 6311
+stop_port 6406
+
+python -m uvicorn api.index:app --host 0.0.0.0 --port 6311 &
+API_PID=$!
+
+npm run dev &
+WEB_PID=$!
+
+wait "$API_PID" "$WEB_PID"
