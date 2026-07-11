@@ -25,11 +25,14 @@ from api.core.processor import (
     resolve_template_html,
 )
 from api.core.gmail_svc import (
+    DEFAULT_SCOPES,
     create_draft,
     exchange_code_for_token,
     get_auth_url,
     load_user_credentials,
+    MissingStoredCredentialsError,
     revoke_user_credentials,
+    token_store,
 )
 import os
 from uuid import uuid4
@@ -137,6 +140,7 @@ def dev_logout(request: Request):
     request.session.pop("user_key", None)
     request.session.pop("oauth_state", None)
     request.session.pop("oauth_user_key", None)
+    request.session.pop("google_credentials", None)
     return {"ok": True}
 
 class DraftRequest(BaseModel):
@@ -1001,6 +1005,59 @@ def _fetch_google_profile(creds: Credentials) -> dict[str, str | None]:
     return profile
 
 
+def _save_creds_to_session(request: Request, creds: Credentials) -> None:
+    data = json.loads(creds.to_json())
+    data.pop("client_secret", None)
+    data.pop("client_id", None)
+    request.session["google_credentials"] = data
+
+
+def _load_creds_from_session(request: Request) -> Credentials | None:
+    data = request.session.get("google_credentials")
+    if not data:
+        return None
+    restored = dict(data)
+    restored["client_id"] = os.environ.get("GOOGLE_CLIENT_ID", "")
+    restored["client_secret"] = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+    try:
+        return Credentials.from_authorized_user_info(restored, scopes=DEFAULT_SCOPES)
+    except Exception:
+        return None
+
+
+def _get_request_credentials(request: Request) -> Credentials:
+    from google.auth.transport.requests import Request as GoogleRequest
+
+    user_key = _require_session_user_key(request)
+
+    creds: Credentials | None = None
+    try:
+        creds = load_user_credentials(user_key)
+    except MissingStoredCredentialsError:
+        creds = None
+
+    if creds is None:
+        creds = _load_creds_from_session(request)
+        if creds is None:
+            raise HTTPException(status_code=401, detail="Google authorization expired. Please reconnect Gmail.")
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(GoogleRequest())
+            except Exception:
+                raise HTTPException(status_code=401, detail="Google authorization expired. Please reconnect Gmail.")
+        try:
+            token_store.save(user_key, creds)
+        except Exception:
+            pass
+
+    try:
+        _save_creds_to_session(request, creds)
+    except Exception:
+        pass
+
+    return creds
+
+
 class RestoreSessionRequest(BaseModel):
     user_key: str
 
@@ -1010,8 +1067,8 @@ def session_restore(request: Request, body: RestoreSessionRequest):
     if not re.fullmatch(r"[a-f0-9]{32}", body.user_key):
         raise HTTPException(status_code=400, detail="Invalid user_key")
     try:
-        creds = load_user_credentials(body.user_key)
         request.session["user_key"] = body.user_key
+        creds = _get_request_credentials(request)
         email = request.session.get("user_email")
         name = request.session.get("user_name")
         if not email or not name:
@@ -1065,6 +1122,7 @@ def google_auth_callback(request: Request, code: str, state: str):
         code_verifier = request.session.get("oauth_code_verifier")
         
         creds = exchange_code_for_token(code=code, state=state, user_key=user_key, code_verifier=code_verifier)
+        _save_creds_to_session(request, creds)
         profile = _fetch_google_profile(creds)
         email = profile.get("email")
         name = profile.get("name")
@@ -1089,6 +1147,7 @@ def google_auth_revoke(request: Request):
     try:
         user_key = _require_session_user_key(request)
         revoke_user_credentials(user_key)
+        request.session.pop("google_credentials", None)
         return {"status": "ok", "revoked": True}
     except HTTPException:
         raise
@@ -1103,8 +1162,7 @@ def list_drive_files(
     q: str | None = None,
 ):
     try:
-        user_key = _require_session_user_key(request)
-        creds = load_user_credentials(user_key)
+        creds = _get_request_credentials(request)
         drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
         response = drive_service.files().list(
             q=_drive_query_for_kind(kind, q),
@@ -1159,8 +1217,7 @@ class DriveFolderCreateRequest(BaseModel):
 @app.post("/api/drive/folders/create")
 def create_drive_folder(request: Request, payload: DriveFolderCreateRequest):
     try:
-        user_key = _require_session_user_key(request)
-        creds = load_user_credentials(user_key)
+        creds = _get_request_credentials(request)
         drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
         folder_name = (payload.folder_name or "").strip() or f"DraftCopier Attachments {datetime.now().strftime('%Y%m%d-%H%M%S')}"
         body: dict[str, object] = {
@@ -1198,8 +1255,7 @@ async def upload_files_to_drive_folder(
     try:
         if not files:
             raise HTTPException(status_code=400, detail={"error": "missing_files"})
-        user_key = _require_session_user_key(request)
-        creds = load_user_credentials(user_key)
+        creds = _get_request_credentials(request)
         drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
         uploaded_items: list[dict[str, object]] = []
         for upload_file in files:
@@ -1240,8 +1296,7 @@ def drive_file_content(
     download: bool = False,
 ):
     try:
-        user_key = _require_session_user_key(request)
-        creds = load_user_credentials(user_key)
+        creds = _get_request_credentials(request)
         drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
         downloaded = _download_drive_file(drive_service, file_id=file_id, kind=kind)
         filename = str(downloaded["name"])
@@ -1287,8 +1342,7 @@ def attachment_content(
         selected_drive_attachments: dict[str, dict[str, str | bytes]] = {}
         needs_drive = bool(drive_file_ids or attachment_drive_folder_id)
         if needs_drive:
-            user_key = _require_session_user_key(request)
-            creds = load_user_credentials(user_key)
+            creds = _get_request_credentials(request)
             drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
             if isinstance(drive_file_ids, list) and drive_file_ids:
                 selected_drive_attachments = _load_selected_drive_attachments(drive_service, drive_file_ids)
@@ -1324,8 +1378,7 @@ def attachment_content(
 @app.post("/api/drafts")
 def create_draft_route(request: Request, payload: DraftRequest):
     try:
-        user_key = _require_session_user_key(request)
-        creds = load_user_credentials(user_key)
+        creds = _get_request_credentials(request)
         draft = create_draft(
             creds=creds,
             to=payload.to,
@@ -1357,8 +1410,7 @@ async def create_drafts_batch(
     attachments_dir: str | None = None,
 ):
     try:
-        user_key = _require_session_user_key(request)
-        creds = load_user_credentials(user_key)
+        creds = _get_request_credentials(request)
         cache_namespace = _get_upload_cache_namespace(request)
         attachment_drive_file_ids = _parse_attachment_drive_file_ids(attachment_drive_file_ids_json)
         selected_drive_attachments: dict[str, dict[str, str | bytes]] = {}
@@ -1563,8 +1615,7 @@ def process_cached_preview(
         attachment_drive_folder_id = attachment_cache.get("drive_folder_id")
         needs_drive = bool(drive_file_ids or attachment_drive_folder_id)
         if needs_drive:
-            user_key = _require_session_user_key(request)
-            creds = load_user_credentials(user_key)
+            creds = _get_request_credentials(request)
             drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
             if isinstance(drive_file_ids, list) and drive_file_ids:
                 selected_drive_attachments = _load_selected_drive_attachments(drive_service, drive_file_ids)
@@ -1609,8 +1660,7 @@ async def load_template_from_docx(
     try:
         drive_service = None
         if docx_drive_file_id:
-            user_key = _require_session_user_key(request)
-            creds = load_user_credentials(user_key)
+            creds = _get_request_credentials(request)
             drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
         docx_name, docx_content = await _read_input_source(
@@ -1677,8 +1727,7 @@ async def process_files(
         creds: Credentials | None = None
         drive_service = None
         if docx_drive_file_id or xlsx_drive_file_id or attachment_drive_file_ids or attachment_drive_folder_id:
-            user_key = _require_session_user_key(request)
-            creds = load_user_credentials(user_key)
+            creds = _get_request_credentials(request)
             drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
         selected_drive_attachments: dict[str, dict[str, str | bytes]] = {}
         if attachment_drive_file_ids and drive_service is not None:

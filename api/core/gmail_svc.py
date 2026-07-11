@@ -43,6 +43,10 @@ class TokenStore(Protocol):
     def delete(self, user_key: str) -> None: ...
 
 
+class MissingStoredCredentialsError(RuntimeError):
+    """Raised when a session exists but no stored Google credentials are available."""
+
+
 class FileTokenStore:
     """
     Backend-only local token store.
@@ -182,7 +186,9 @@ def load_user_credentials(user_key: str) -> Credentials:
     """
     creds = token_store.load(user_key)
     if creds is None:
-        raise RuntimeError(f"No stored Gmail credentials for user_key={user_key!r}")
+        raise MissingStoredCredentialsError(
+            f"No stored Gmail credentials for user_key={user_key!r}"
+        )
 
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
