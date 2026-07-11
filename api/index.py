@@ -11,11 +11,14 @@ import json
 import re
 import traceback
 import io
+import base64
+from urllib.parse import quote
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from api.core.processor import (
+    apply_global_font_fallback,
     export_html_to_docx_bytes,
     inject_variables,
     resolve_gmail_font,
@@ -245,7 +248,7 @@ def _find_attachment_headers(headers: list[object]) -> list[object]:
     matched = []
     for header in headers:
         name = _normalize_header(header)
-        if name.startswith(ATTACHMENT_HEADER_PREFIX):
+        if name == ATTACHMENT_HEADER_PREFIX:
             matched.append(header)
     return matched
 
@@ -271,8 +274,8 @@ def _split_attachment_names(value: object) -> list[str]:
     text = str(value).strip()
     if not text:
         return []
-    # Allow multiple filenames separated by comma/semicolon/newline
-    parts = [p.strip() for p in re.split(r"[;,\n]+", text)]
+    # Allow multiple filenames in one cell. Do not split on spaces because filenames may contain spaces.
+    parts = [p.strip() for p in re.split(r"[;,，；、\n\r]+", text)]
     return [p for p in parts if p and str(p).lower() not in ('nan', 'none', 'null')]
 
 
@@ -326,41 +329,84 @@ def _cache_root_for_namespace(namespace: str) -> Path:
     return UPLOAD_CACHE_DIR / safe_name
 
 
+def _cache_dir_for(namespace: str, cache_id: str) -> Path:
+    return _cache_root_for_namespace(namespace) / cache_id
+
+
+def _build_attachment_lookup(
+    attachments: list[dict[str, str | bytes]],
+) -> dict[str, dict[str, str | bytes]]:
+    selected: dict[str, dict[str, str | bytes]] = {}
+    for attachment in attachments:
+        filename = str(attachment.get("filename") or "attachment")
+        selected[filename] = attachment
+        selected[Path(filename).name] = attachment
+    return selected
+
+
 def _write_upload_cache(
     *,
     namespace: str,
-    docx_name: str,
-    docx_content: bytes,
+    docx_name: str | None,
+    docx_content: bytes | None,
     xlsx_name: str,
     xlsx_content: bytes,
+    template_html: str | None = None,
+    attachment_cache: dict[str, object] | None = None,
 ) -> dict[str, str]:
     cache_id = uuid4().hex
     cache_root = _cache_root_for_namespace(namespace)
     cache_dir = cache_root / cache_id
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_docx_name = _safe_upload_name(docx_name, "template.docx")
+    safe_docx_name = _safe_upload_name(docx_name or "編輯器內容", "template.docx")
     safe_xlsx_name = _safe_upload_name(xlsx_name, "list.xlsx")
-    (cache_dir / "template.docx").write_bytes(docx_content)
+    if docx_content is not None:
+        (cache_dir / "template.docx").write_bytes(docx_content)
     (cache_dir / "recipients.xlsx").write_bytes(xlsx_content)
     (cache_dir / "meta.txt").write_text(f"{safe_docx_name}\n{safe_xlsx_name}\n", encoding="utf-8")
+    (cache_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "docx_name": safe_docx_name,
+                "xlsx_name": safe_xlsx_name,
+                "template_html": template_html,
+                "attachment_cache": attachment_cache or {},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
     return {"cache_id": cache_id, "docx_name": safe_docx_name, "xlsx_name": safe_xlsx_name}
 
 
-def _read_upload_cache(*, namespace: str, cache_id: str) -> dict[str, bytes | str]:
+def _read_upload_cache(*, namespace: str, cache_id: str) -> dict[str, object]:
     if not cache_id or not re.fullmatch(r"[a-f0-9]{32}", cache_id):
         raise HTTPException(status_code=400, detail={"error": "invalid_cache_id"})
-    cache_dir = _cache_root_for_namespace(namespace) / cache_id
+    cache_dir = _cache_dir_for(namespace, cache_id)
     docx_path = cache_dir / "template.docx"
     xlsx_path = cache_dir / "recipients.xlsx"
-    if not docx_path.exists() or not xlsx_path.exists():
+    if not xlsx_path.exists():
         raise HTTPException(status_code=400, detail={"error": "cache_not_found", "cache_id": cache_id})
 
     docx_name = "template.docx"
     xlsx_name = "list.xlsx"
+    template_html: str | None = None
+    attachment_cache: dict[str, object] = {}
+    meta_json_path = cache_dir / "meta.json"
+    if meta_json_path.exists():
+        meta = json.loads(meta_json_path.read_text(encoding="utf-8"))
+        if isinstance(meta.get("docx_name"), str) and meta["docx_name"]:
+            docx_name = meta["docx_name"]
+        if isinstance(meta.get("xlsx_name"), str) and meta["xlsx_name"]:
+            xlsx_name = meta["xlsx_name"]
+        if isinstance(meta.get("template_html"), str):
+            template_html = meta["template_html"]
+        if isinstance(meta.get("attachment_cache"), dict):
+            attachment_cache = meta["attachment_cache"]
     meta_path = cache_dir / "meta.txt"
-    if meta_path.exists():
+    if meta_path.exists() and not meta_json_path.exists():
         lines = meta_path.read_text(encoding="utf-8").splitlines()
         if len(lines) >= 2:
             docx_name = lines[0] or docx_name
@@ -369,9 +415,102 @@ def _read_upload_cache(*, namespace: str, cache_id: str) -> dict[str, bytes | st
     return {
         "docx_name": docx_name,
         "xlsx_name": xlsx_name,
-        "docx_content": docx_path.read_bytes(),
+        "docx_content": docx_path.read_bytes() if docx_path.exists() else None,
         "xlsx_content": xlsx_path.read_bytes(),
+        "template_html": template_html,
+        "attachment_cache": attachment_cache,
     }
+
+
+def _sanitize_attachment_cache(raw: object) -> dict[str, object]:
+    if not isinstance(raw, dict):
+        return {}
+    drive_file_ids = raw.get("drive_file_ids")
+    local_files = raw.get("local_files")
+    return {
+        "drive_file_ids": [item for item in drive_file_ids if isinstance(item, str) and item.strip()]
+        if isinstance(drive_file_ids, list)
+        else [],
+        "drive_folder_id": raw.get("drive_folder_id")
+        if isinstance(raw.get("drive_folder_id"), str) and str(raw.get("drive_folder_id")).strip()
+        else None,
+        "attachments_dir": raw.get("attachments_dir")
+        if isinstance(raw.get("attachments_dir"), str) and str(raw.get("attachments_dir")).strip()
+        else None,
+        "local_files": local_files if isinstance(local_files, list) else [],
+    }
+
+
+def _build_attachment_cache_payload(
+    *,
+    drive_file_ids: list[str],
+    drive_folder_id: str | None,
+    attachments_dir: str | None,
+    local_attachments: list[dict[str, str | bytes]],
+) -> dict[str, object]:
+    return {
+        "drive_file_ids": drive_file_ids,
+        "drive_folder_id": drive_folder_id.strip() if drive_folder_id and drive_folder_id.strip() else None,
+        "attachments_dir": attachments_dir.strip() if attachments_dir and attachments_dir.strip() else None,
+        "local_files": [
+            {
+                "filename": str(item.get("filename") or "attachment"),
+                "mime_type": str(item.get("mime_type") or "application/octet-stream"),
+                "content_base64": base64.b64encode(bytes(item.get("content") or b"")).decode("ascii"),
+            }
+            for item in local_attachments
+        ],
+    }
+
+
+def _rehydrate_cached_local_attachments(raw: object) -> tuple[dict[str, dict[str, str | bytes]], list[dict[str, str | bytes]]]:
+    attachment_cache = _sanitize_attachment_cache(raw)
+    items: list[dict[str, str | bytes]] = []
+    for file_meta in attachment_cache["local_files"]:
+        if not isinstance(file_meta, dict):
+            continue
+        filename = file_meta.get("filename")
+        mime_type = file_meta.get("mime_type")
+        content_base64 = file_meta.get("content_base64")
+        if not isinstance(filename, str) or not filename:
+            continue
+        if not isinstance(content_base64, str):
+            continue
+        try:
+            content = base64.b64decode(content_base64)
+        except Exception:
+            continue
+        items.append(
+            {
+                "filename": filename,
+                "mime_type": str(mime_type or "application/octet-stream"),
+                "content": content,
+                "source": "local_upload",
+            }
+        )
+    return _build_attachment_lookup(items), items
+
+
+def _is_previewable_attachment(mime_type: str) -> bool:
+    return (
+        mime_type == "application/pdf"
+        or mime_type.startswith("image/")
+        or mime_type.startswith("text/")
+    )
+
+
+def _attachment_for_gmail(attachment: dict[str, str | bytes]) -> dict[str, str | bytes]:
+    return {
+        "filename": str(attachment.get("filename") or "attachment"),
+        "content": bytes(attachment.get("content") or b""),
+        "mime_type": str(attachment.get("mime_type") or "application/octet-stream"),
+    }
+
+
+def _content_disposition(disposition: str, filename: str) -> str:
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii") or "attachment"
+    quoted_name = quote(filename, safe="")
+    return f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted_name}"
 
 
 def _build_preview_payload(
@@ -384,6 +523,7 @@ def _build_preview_payload(
     cache_info: dict[str, str] | None,
     preview_page: int,
     preview_page_size: int,
+    attachment_context: dict[str, object] | None = None,
 ) -> dict:
     font_family = resolve_gmail_font(font)
     html_template = resolve_template_html(
@@ -446,6 +586,39 @@ def _build_preview_payload(
             "attachments": attachment_headers,
         },
     }
+    if rows and attachment_headers:
+        attachment_items: list[dict[str, object]] = []
+        if attachment_context:
+            attachments_dir = str(attachment_context.get("attachments_dir") or "")
+            selected_drive_attachments = attachment_context.get("selected_drive_attachments") or {}
+            selected_local_attachments = attachment_context.get("selected_local_attachments") or {}
+            creds = attachment_context.get("creds")
+            drive_service = attachment_context.get("drive_service")
+            attachment_drive_folder_id = attachment_context.get("attachment_drive_folder_id")
+            resolved_attachments, _ = _resolve_row_attachments(
+                row=rows[0],
+                row_index=1,
+                attachment_headers_raw=attachment_headers,
+                selected_drive_attachments=selected_drive_attachments if isinstance(selected_drive_attachments, dict) else {},
+                selected_local_attachments=selected_local_attachments if isinstance(selected_local_attachments, dict) else {},
+                base_dir=Path(attachments_dir).expanduser().resolve() if attachments_dir else ATTACHMENTS_DIR,
+                creds=creds if isinstance(creds, Credentials) else None,
+                drive_service=drive_service,
+                attachment_drive_folder_id=str(attachment_drive_folder_id) if attachment_drive_folder_id else None,
+            )
+            for attachment_index, item in enumerate(resolved_attachments):
+                mime_type = str(item.get("mime_type") or "application/octet-stream")
+                attachment_items.append(
+                    {
+                        "name": str(item.get("filename") or item.get("requested_name") or "attachment"),
+                        "mime_type": mime_type,
+                        "source": str(item.get("source") or "attachment"),
+                        "previewable": _is_previewable_attachment(mime_type),
+                        "attachment_index": attachment_index,
+                        "row_index": 0,
+                    }
+                )
+        payload["first_row_attachments"] = attachment_items
     if cache_info:
         payload["cache_id"] = cache_info["cache_id"]
         payload["cached_files"] = {
@@ -662,35 +835,110 @@ def _load_selected_drive_attachments(
     drive_service,
     file_ids: list[str],
 ) -> dict[str, dict[str, str | bytes]]:
-    selected: dict[str, dict[str, str | bytes]] = {}
+    items: list[dict[str, str | bytes]] = []
     for file_id in file_ids:
         downloaded = _download_drive_file(drive_service, file_id=file_id, kind="attachment")
         filename = str(downloaded["name"])
-        attachment = {
-            "filename": filename,
-            "content": downloaded["content"],
-            "mime_type": str(downloaded["mime_type"]),
-        }
-        selected[filename] = attachment
-        selected[Path(filename).name] = attachment
-    return selected
+        items.append(
+            {
+                "filename": filename,
+                "content": downloaded["content"],
+                "mime_type": str(downloaded["mime_type"]),
+                "source": "drive_selected",
+                "file_id": str(downloaded.get("file_id") or file_id),
+            }
+        )
+    return _build_attachment_lookup(items)
 
 
 async def _load_uploaded_local_attachments(
     upload_files: list[UploadFile] | None,
-) -> dict[str, dict[str, str | bytes]]:
-    selected: dict[str, dict[str, str | bytes]] = {}
+) -> tuple[dict[str, dict[str, str | bytes]], list[dict[str, str | bytes]]]:
+    items: list[dict[str, str | bytes]] = []
     for upload_file in upload_files or []:
         filename = upload_file.filename or "attachment"
         content = await upload_file.read()
-        attachment = {
-            "filename": filename,
-            "content": content,
-            "mime_type": upload_file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
-        }
-        selected[filename] = attachment
-        selected[Path(filename).name] = attachment
-    return selected
+        items.append(
+            {
+                "filename": filename,
+                "content": content,
+                "mime_type": upload_file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+                "source": "local_upload",
+            }
+        )
+    return _build_attachment_lookup(items), items
+
+
+def _resolve_row_attachments(
+    *,
+    row: dict[str, object],
+    row_index: int,
+    attachment_headers_raw: list[object],
+    selected_drive_attachments: dict[str, dict[str, str | bytes]],
+    selected_local_attachments: dict[str, dict[str, str | bytes]],
+    base_dir: Path,
+    creds: Credentials | None,
+    drive_service,
+    attachment_drive_folder_id: str | None,
+) -> tuple[list[dict[str, str | bytes]], list[dict[str, object]]]:
+    attachments_for_row: list[dict[str, str | bytes]] = []
+    failed_items: list[dict[str, object]] = []
+    for header in attachment_headers_raw:
+        value = row.get(header)
+        if row_index <= 3:
+            print(f"[attachments] row {row_index} header={header!r} type={type(value)} value={value!r}")
+        for name in _split_attachment_names(value):
+            resolved: dict[str, str | bytes] | None = None
+            selected_attachment = selected_drive_attachments.get(name) or selected_drive_attachments.get(Path(name).name)
+            if selected_attachment:
+                resolved = dict(selected_attachment)
+            if not resolved:
+                selected_local = selected_local_attachments.get(name) or selected_local_attachments.get(Path(name).name)
+                if selected_local:
+                    resolved = dict(selected_local)
+            name_path = Path(name)
+            should_try_local = name_path.is_absolute() or base_dir.exists()
+            if not resolved and should_try_local:
+                resolved = _resolve_attachment_from_disk(
+                    name=name,
+                    base_dir=base_dir,
+                    allow_absolute=ALLOW_ABSOLUTE_ATTACHMENTS,
+                    roots=ATTACHMENTS_ROOTS,
+                )
+                if resolved:
+                    resolved["source"] = "local_folder"
+            elif not resolved and row_index <= 3:
+                print(f"[attachments] base_dir 不存在，略過本地相對路徑，改用 Drive 查詢: row={row_index} name={name!r}")
+            if not resolved:
+                print(f"[attachments] Drive fallback lookup: row={row_index} name={name!r}")
+                try:
+                    if creds is None:
+                        raise RuntimeError("Drive credential unavailable for attachment preview")
+                    resolved = get_attachment_content(
+                        name,
+                        creds,
+                        drive_service=drive_service,
+                        parent_folder_id=attachment_drive_folder_id,
+                    )
+                    resolved["source"] = "drive_folder" if attachment_drive_folder_id else "drive_fallback"
+                    if row_index <= 3:
+                        print(
+                            f"[attachments] Drive fallback success: row={row_index} name={name!r} resolved={resolved.get('filename')!r}"
+                        )
+                except Exception as e:
+                    print(f"[ERROR] 找不到附件檔案: {name} (位於第 {row_index} 列) err={e}")
+                    failed_items.append(
+                        {
+                            "row": row_index,
+                            "field": "attachment",
+                            "name": name,
+                            "message": str(e),
+                        }
+                    )
+                    continue
+            resolved["requested_name"] = name
+            attachments_for_row.append(resolved)
+    return attachments_for_row, failed_items
 
 
 async def _read_input_source(
@@ -983,6 +1231,96 @@ async def upload_files_to_drive_folder(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/api/drive/file-content")
+def drive_file_content(
+    request: Request,
+    file_id: str,
+    kind: str = "attachment",
+    download: bool = False,
+):
+    try:
+        user_key = _require_session_user_key(request)
+        creds = load_user_credentials(user_key)
+        drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        downloaded = _download_drive_file(drive_service, file_id=file_id, kind=kind)
+        filename = str(downloaded["name"])
+        mime_type = str(downloaded["mime_type"])
+        disposition = "attachment" if download else "inline"
+        return Response(
+            content=bytes(downloaded["content"]),
+            media_type=mime_type,
+            headers={"Content-Disposition": _content_disposition(disposition, filename)},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/attachments/content")
+def attachment_content(
+    request: Request,
+    cache_id: str,
+    row: int,
+    attachment_index: int,
+    sheet: str | None = None,
+    download: bool = False,
+):
+    try:
+        cache_namespace = _get_upload_cache_namespace(request)
+        cached = _read_upload_cache(namespace=cache_namespace, cache_id=cache_id)
+        xlsx_content = cached["xlsx_content"]
+        if not isinstance(xlsx_content, bytes):
+            raise HTTPException(status_code=500, detail={"error": "invalid_cache_payload"})
+        attachment_cache = _sanitize_attachment_cache(cached.get("attachment_cache"))
+        df, _, _ = _read_recipient_sheet(xlsx_content, sheet)
+        rows = df.to_dict(orient="records")
+        if row < 0 or row >= len(rows):
+            raise HTTPException(status_code=404, detail={"error": "row_out_of_range"})
+        attachment_headers_raw = _find_attachment_headers(list(df.columns))
+        selected_local_attachments, _ = _rehydrate_cached_local_attachments(attachment_cache)
+        drive_file_ids = attachment_cache.get("drive_file_ids")
+        attachment_drive_folder_id = attachment_cache.get("drive_folder_id")
+        creds: Credentials | None = None
+        drive_service = None
+        selected_drive_attachments: dict[str, dict[str, str | bytes]] = {}
+        needs_drive = bool(drive_file_ids or attachment_drive_folder_id)
+        if needs_drive:
+            user_key = _require_session_user_key(request)
+            creds = load_user_credentials(user_key)
+            drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+            if isinstance(drive_file_ids, list) and drive_file_ids:
+                selected_drive_attachments = _load_selected_drive_attachments(drive_service, drive_file_ids)
+        resolved_attachments, _ = _resolve_row_attachments(
+            row=rows[row],
+            row_index=row + 1,
+            attachment_headers_raw=attachment_headers_raw,
+            selected_drive_attachments=selected_drive_attachments,
+            selected_local_attachments=selected_local_attachments,
+            base_dir=Path(str(attachment_cache.get("attachments_dir") or "")).expanduser().resolve()
+            if attachment_cache.get("attachments_dir")
+            else ATTACHMENTS_DIR,
+            creds=creds,
+            drive_service=drive_service,
+            attachment_drive_folder_id=str(attachment_drive_folder_id) if attachment_drive_folder_id else None,
+        )
+        if attachment_index < 0 or attachment_index >= len(resolved_attachments):
+            raise HTTPException(status_code=404, detail={"error": "attachment_out_of_range"})
+        attachment = resolved_attachments[attachment_index]
+        filename = str(attachment.get("filename") or "attachment")
+        mime_type = str(attachment.get("mime_type") or "application/octet-stream")
+        disposition = "attachment" if download else "inline"
+        return Response(
+            content=bytes(attachment.get("content") or b""),
+            media_type=mime_type,
+            headers={"Content-Disposition": _content_disposition(disposition, filename)},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/drafts")
 def create_draft_route(request: Request, payload: DraftRequest):
     try:
@@ -1024,12 +1362,13 @@ async def create_drafts_batch(
         cache_namespace = _get_upload_cache_namespace(request)
         attachment_drive_file_ids = _parse_attachment_drive_file_ids(attachment_drive_file_ids_json)
         selected_drive_attachments: dict[str, dict[str, str | bytes]] = {}
-        selected_local_attachments = await _load_uploaded_local_attachments(attachment_local_files)
+        selected_local_attachments, _ = await _load_uploaded_local_attachments(attachment_local_files)
 
         docx_content: bytes | None = None
         drive_service_for_inputs = None
         if docx_drive_file_id or xlsx_drive_file_id:
             drive_service_for_inputs = build("drive", "v3", credentials=creds, cache_discovery=False)
+        cached_attachment_cache: dict[str, object] = {}
 
         if docx_file and xlsx_file:
             docx_content = await docx_file.read()
@@ -1038,8 +1377,13 @@ async def create_drafts_batch(
             cached = _read_upload_cache(namespace=cache_namespace, cache_id=cache_id)
             docx_content = cached["docx_content"]
             xlsx_content = cached["xlsx_content"]
-            if not isinstance(docx_content, bytes) or not isinstance(xlsx_content, bytes):
+            cached_attachment_cache = _sanitize_attachment_cache(cached.get("attachment_cache"))
+            if docx_content is not None and not isinstance(docx_content, bytes):
                 raise HTTPException(status_code=500, detail={"error": "invalid_cache_payload"})
+            if not isinstance(xlsx_content, bytes):
+                raise HTTPException(status_code=500, detail={"error": "invalid_cache_payload"})
+            if not template_html and isinstance(cached.get("template_html"), str):
+                template_html = str(cached.get("template_html"))
         elif xlsx_file and template_html:
             xlsx_content = await xlsx_file.read()
         elif xlsx_drive_file_id and template_html:
@@ -1064,6 +1408,15 @@ async def create_drafts_batch(
                     "message": "Need cache_id, docx/xlsx files, or xlsx source with template_html.",
                 },
             )
+
+        if not attachment_drive_file_ids and isinstance(cached_attachment_cache.get("drive_file_ids"), list):
+            attachment_drive_file_ids = [str(item) for item in cached_attachment_cache["drive_file_ids"]]
+        if not attachment_drive_folder_id and isinstance(cached_attachment_cache.get("drive_folder_id"), str):
+            attachment_drive_folder_id = str(cached_attachment_cache["drive_folder_id"])
+        if not attachments_dir and isinstance(cached_attachment_cache.get("attachments_dir"), str):
+            attachments_dir = str(cached_attachment_cache["attachments_dir"])
+        if not selected_local_attachments:
+            selected_local_attachments, _ = _rehydrate_cached_local_attachments(cached_attachment_cache)
 
         font_family = resolve_gmail_font(font)
         html_template = resolve_template_html(
@@ -1126,56 +1479,18 @@ async def create_drafts_batch(
                 can_send = False
             row_can_send.append(can_send)
 
-            attachments_for_row: list[dict[str, str | bytes]] = []
-            for header in attachment_headers_raw:
-                value = row.get(header)
-                if idx <= 3:
-                    print(f"[attachments] row {idx} header={header!r} type={type(value)} value={value!r}")
-                for name in _split_attachment_names(value):
-                    resolved: dict[str, str | bytes] | None = None
-                    selected_attachment = selected_drive_attachments.get(name) or selected_drive_attachments.get(Path(name).name)
-                    if selected_attachment:
-                        resolved = selected_attachment
-                    if not resolved:
-                        resolved = selected_local_attachments.get(name) or selected_local_attachments.get(Path(name).name)
-                    name_path = Path(name)
-                    should_try_local = name_path.is_absolute() or base_dir.exists()
-                    if not resolved and should_try_local:
-                        resolved = _resolve_attachment_from_disk(
-                            name=name,
-                            base_dir=base_dir,
-                            allow_absolute=ALLOW_ABSOLUTE_ATTACHMENTS,
-                            roots=ATTACHMENTS_ROOTS,
-                        )
-                    elif not resolved and idx <= 3:
-                        print(
-                            f"[attachments] base_dir 不存在，略過本地相對路徑，改用 Drive 查詢: row={idx} name={name!r}"
-                        )
-                    if not resolved:
-                        print(f"[attachments] Drive fallback lookup: row={idx} name={name!r}")
-                        try:
-                            resolved = get_attachment_content(
-                                name,
-                                creds,
-                                drive_service=drive_service,
-                                parent_folder_id=attachment_drive_folder_id,
-                            )
-                            if idx <= 3:
-                                print(
-                                    f"[attachments] Drive fallback success: row={idx} name={name!r} resolved={resolved.get('filename')!r}"
-                                )
-                        except Exception as e:
-                            print(f"[ERROR] 找不到附件檔案: {name} (位於第 {idx} 列) err={e}")
-                            failed_items.append(
-                                {
-                                    "row": idx,
-                                    "field": "attachment",
-                                    "name": name,
-                                    "message": str(e),
-                                }
-                            )
-                            continue
-                    attachments_for_row.append(resolved)
+            attachments_for_row, attachment_errors = _resolve_row_attachments(
+                row=row,
+                row_index=idx,
+                attachment_headers_raw=attachment_headers_raw,
+                selected_drive_attachments=selected_drive_attachments,
+                selected_local_attachments=selected_local_attachments,
+                base_dir=base_dir,
+                creds=creds,
+                drive_service=drive_service,
+                attachment_drive_folder_id=attachment_drive_folder_id,
+            )
+            failed_items.extend(attachment_errors)
             row_attachments.append(attachments_for_row)
 
         drafts = []
@@ -1193,7 +1508,7 @@ async def create_drafts_batch(
                     body_html=body_html,
                     cc=cc_value,
                     bcc=bcc_value,
-                    attachments=row_attachments[idx - 1],
+                    attachments=[_attachment_for_gmail(item) for item in row_attachments[idx - 1]],
                 )
                 drafts.append(draft.get("id"))
             except Exception as e:
@@ -1229,22 +1544,47 @@ def process_cached_preview(
         cached = _read_upload_cache(namespace=cache_namespace, cache_id=cache_id)
         docx_content = cached["docx_content"]
         xlsx_content = cached["xlsx_content"]
-        if not isinstance(docx_content, bytes) or not isinstance(xlsx_content, bytes):
+        template_html = cached.get("template_html")
+        attachment_cache = _sanitize_attachment_cache(cached.get("attachment_cache"))
+        if docx_content is not None and not isinstance(docx_content, bytes):
+            raise HTTPException(status_code=500, detail={"error": "invalid_cache_payload"})
+        if not isinstance(xlsx_content, bytes):
             raise HTTPException(status_code=500, detail={"error": "invalid_cache_payload"})
         cache_info = {
             "cache_id": cache_id,
             "docx_name": str(cached["docx_name"]),
             "xlsx_name": str(cached["xlsx_name"]),
         }
+        creds: Credentials | None = None
+        drive_service = None
+        selected_drive_attachments: dict[str, dict[str, str | bytes]] = {}
+        selected_local_attachments, _ = _rehydrate_cached_local_attachments(attachment_cache)
+        drive_file_ids = attachment_cache.get("drive_file_ids")
+        attachment_drive_folder_id = attachment_cache.get("drive_folder_id")
+        needs_drive = bool(drive_file_ids or attachment_drive_folder_id)
+        if needs_drive:
+            user_key = _require_session_user_key(request)
+            creds = load_user_credentials(user_key)
+            drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+            if isinstance(drive_file_ids, list) and drive_file_ids:
+                selected_drive_attachments = _load_selected_drive_attachments(drive_service, drive_file_ids)
         return _build_preview_payload(
             docx_content=docx_content,
-            template_html=None,
+            template_html=template_html if isinstance(template_html, str) else None,
             xlsx_content=xlsx_content,
             sheet=sheet,
             font=font,
             cache_info=cache_info,
             preview_page=preview_page,
             preview_page_size=preview_page_size,
+            attachment_context={
+                "selected_drive_attachments": selected_drive_attachments,
+                "selected_local_attachments": selected_local_attachments,
+                "attachments_dir": attachment_cache.get("attachments_dir"),
+                "attachment_drive_folder_id": attachment_drive_folder_id,
+                "creds": creds,
+                "drive_service": drive_service,
+            },
         )
     except HTTPException:
         raise
@@ -1256,6 +1596,7 @@ def process_cached_preview(
 class TemplateExportRequest(BaseModel):
     template_html: str
     filename: str | None = None
+    font: str | None = None
 
 
 @app.post("/api/template/load")
@@ -1298,11 +1639,16 @@ def export_template_docx(payload: TemplateExportRequest):
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._") or "template"
         if not safe_name.lower().endswith(".docx"):
             safe_name = f"{safe_name}.docx"
-        content = export_html_to_docx_bytes(payload.template_html)
+        content = export_html_to_docx_bytes(
+            apply_global_font_fallback(
+                payload.template_html,
+                base_font_family=resolve_gmail_font(payload.font),
+            )
+        )
         return Response(
             content=content,
             media_type=DOCX_MIME,
-            headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+            headers={"Content-Disposition": _content_disposition("attachment", safe_name)},
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1314,19 +1660,29 @@ async def process_files(
     xlsx_file: UploadFile | None = File(None),
     docx_drive_file_id: str | None = Form(None),
     xlsx_drive_file_id: str | None = Form(None),
+    attachment_drive_file_ids_json: str | None = Form(None),
+    attachment_drive_folder_id: str | None = Form(None),
+    attachment_local_files: list[UploadFile] | None = File(None),
     template_html: str | None = Form(None),
     sheet: str | None = None,
     font: str | None = None,
+    attachments_dir: str | None = None,
     preview_page: int = 1,
     preview_page_size: int = 20,
 ):
     try:
         cache_namespace = _get_upload_cache_namespace(request)
+        attachment_drive_file_ids = _parse_attachment_drive_file_ids(attachment_drive_file_ids_json)
+        selected_local_attachments, cached_local_attachments = await _load_uploaded_local_attachments(attachment_local_files)
+        creds: Credentials | None = None
         drive_service = None
-        if docx_drive_file_id or xlsx_drive_file_id:
+        if docx_drive_file_id or xlsx_drive_file_id or attachment_drive_file_ids or attachment_drive_folder_id:
             user_key = _require_session_user_key(request)
             creds = load_user_credentials(user_key)
             drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        selected_drive_attachments: dict[str, dict[str, str | bytes]] = {}
+        if attachment_drive_file_ids and drive_service is not None:
+            selected_drive_attachments = _load_selected_drive_attachments(drive_service, attachment_drive_file_ids)
 
         xlsx_name, xlsx_content = await _read_input_source(
             kind="xlsx",
@@ -1349,6 +1705,29 @@ async def process_files(
                 docx_content=docx_content,
                 xlsx_name=xlsx_name,
                 xlsx_content=xlsx_content,
+                template_html=template_html,
+                attachment_cache=_build_attachment_cache_payload(
+                    drive_file_ids=attachment_drive_file_ids,
+                    drive_folder_id=attachment_drive_folder_id,
+                    attachments_dir=attachments_dir,
+                    local_attachments=cached_local_attachments,
+                ),
+            )
+            request.session["latest_cache_id"] = cache_info["cache_id"]
+        else:
+            cache_info = _write_upload_cache(
+                namespace=cache_namespace,
+                docx_name="編輯器內容",
+                docx_content=None,
+                xlsx_name=xlsx_name,
+                xlsx_content=xlsx_content,
+                template_html=template_html,
+                attachment_cache=_build_attachment_cache_payload(
+                    drive_file_ids=attachment_drive_file_ids,
+                    drive_folder_id=attachment_drive_folder_id,
+                    attachments_dir=attachments_dir,
+                    local_attachments=cached_local_attachments,
+                ),
             )
             request.session["latest_cache_id"] = cache_info["cache_id"]
         return _build_preview_payload(
@@ -1360,6 +1739,14 @@ async def process_files(
             cache_info=cache_info,
             preview_page=preview_page,
             preview_page_size=preview_page_size,
+            attachment_context={
+                "selected_drive_attachments": selected_drive_attachments,
+                "selected_local_attachments": selected_local_attachments,
+                "attachments_dir": attachments_dir,
+                "attachment_drive_folder_id": attachment_drive_folder_id,
+                "creds": creds,
+                "drive_service": drive_service,
+            },
         )
     except Exception as e:
         traceback.print_exc()

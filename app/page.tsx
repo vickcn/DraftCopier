@@ -39,6 +39,16 @@ type PreviewPayload = {
     subject: string | null;
     attachments?: string[];
   };
+  first_row_attachments?: AttachmentPreviewItem[];
+};
+
+type AttachmentPreviewItem = {
+  name: string;
+  mime_type: string;
+  source: string;
+  previewable: boolean;
+  attachment_index: number;
+  row_index: number;
 };
 
 type UploadState = "idle" | "uploading" | "done" | "error";
@@ -92,6 +102,16 @@ type PickerConfig = {
 
 type FolderBrowserPurpose = "lookup" | "create-parent";
 
+type AttachmentPreviewEntry = {
+  id: string;
+  name: string;
+  mimeType: string;
+  sourceLabel: string;
+  previewable: boolean;
+  inlineUrl: string;
+  downloadUrl: string;
+};
+
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "";
 const uploadCacheKey = "draftcopier_upload_cache_v1";
 const userKeyCacheKey = "draftcopier_user_key_v1";
@@ -127,6 +147,22 @@ const fontOptions = [
   { label: "Trebuchet MS", value: "Trebuchet MS" },
   { label: "Verdana", value: "Verdana" },
 ];
+const fontFallbackStacks: Record<string, string> = {
+  "Sans Serif": "Arial, Helvetica, sans-serif",
+  Serif: "'Times New Roman', Times, serif",
+  "等寬字型": "'Courier New', Courier, monospace",
+  "微軟正黑體": "'Microsoft JhengHei', 'PingFang TC', 'Noto Sans TC', sans-serif",
+  "新細明體": "'PMingLiU', 'MingLiU', 'Noto Serif TC', serif",
+  "細明體": "'MingLiU', 'PMingLiU', 'Noto Serif TC', serif",
+  "寬": "'Arial Black', 'Impact', sans-serif",
+  "窄": "'Arial Narrow', 'Helvetica Neue Condensed', sans-serif",
+  "Comic Sans MS": "'Comic Sans MS', 'Comic Sans', cursive",
+  Garamond: "Garamond, 'Times New Roman', serif",
+  Georgia: "Georgia, 'Times New Roman', serif",
+  Tahoma: "Tahoma, 'Segoe UI', sans-serif",
+  "Trebuchet MS": "'Trebuchet MS', 'Segoe UI', sans-serif",
+  Verdana: "Verdana, 'Segoe UI', sans-serif",
+};
 
 const emailFieldCandidates = new Set([
   "email",
@@ -166,7 +202,7 @@ const subjectFieldCandidates = new Set([
 ]);
 
 const defaultTemplateHtml =
-  '<div style="font-family: Arial, Helvetica, sans-serif; line-height: 1.6; color: #333;"><p>請在這裡編輯郵件內容</p></div>';
+  '<div style="line-height: 1.6; color: #333;"><p>請在這裡編輯郵件內容</p></div>';
 const placeholderPattern = /\{\{\s*([^{}]+?)\s*\}\}/g;
 
 function stripTemplatePlaceholderMarkup(html: string): string {
@@ -282,6 +318,26 @@ function collectTemplateFieldKeys(templateHtml: string): Set<string> {
   return keys;
 }
 
+function isPreviewableAttachmentMime(mimeType: string): boolean {
+  return (
+    mimeType === "application/pdf" ||
+    mimeType.startsWith("image/") ||
+    mimeType.startsWith("text/")
+  );
+}
+
+function splitAttachmentCell(value?: string): string[] {
+  if (!value) return [];
+  return value
+    .split(/[;,，；、\n\r]+/)
+    .map((part) => part.trim())
+    .filter((part) => part && !["nan", "none", "null"].includes(part.toLowerCase()));
+}
+
+function resolveFontFallbackStack(font: string): string {
+  return fontFallbackStacks[font] || fontFallbackStacks["Sans Serif"];
+}
+
 export default function Home() {
   const [docxFile, setDocxFile] = useState<File | null>(null);
   const [xlsxFile, setXlsxFile] = useState<File | null>(null);
@@ -299,6 +355,7 @@ export default function Home() {
   const [preview, setPreview] = useState<PreviewPayload | null>(null);
   const [isDragActive, setIsDragActive] = useState(false);
   const [selectedFont, setSelectedFont] = useState(fontOptions[0].value);
+  const [fontControlValue, setFontControlValue] = useState(fontOptions[0].value);
   const [draftStatus, setDraftStatus] = useState<"idle" | "saving" | "done" | "error">("idle");
   const [draftMessage, setDraftMessage] = useState<string | null>(null);
   const [draftFailedItems, setDraftFailedItems] = useState<BatchFailedItem[]>([]);
@@ -329,6 +386,9 @@ export default function Home() {
   const [showGuide, setShowGuide] = useState(false);
   const [previewPage, setPreviewPage] = useState(1);
   const [previewPageSize, setPreviewPageSize] = useState(previewPageSizeOptions[0]);
+  const [attachmentPreviewItems, setAttachmentPreviewItems] = useState<AttachmentPreviewEntry[]>([]);
+  const [attachmentPreviewIndex, setAttachmentPreviewIndex] = useState(0);
+  const [showAttachmentPreview, setShowAttachmentPreview] = useState(false);
 
   const statusLabel: Record<UploadState, string> = {
     idle: "待命",
@@ -344,6 +404,23 @@ export default function Home() {
   const editorRef = useRef<HTMLDivElement>(null);
   const restoreAttemptedRef = useRef<string | null>(null);
   const pickerTokenRef = useRef<string | null>(null);
+  const attachmentObjectUrlsRef = useRef<string[]>([]);
+
+  const hasExpandedEditorSelection = () => {
+    const editor = editorRef.current;
+    const selection = window.getSelection();
+    if (!editor || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      return false;
+    }
+    const anchorNode = selection.anchorNode;
+    const focusNode = selection.focusNode;
+    const containsNode = (node: Node | null) => {
+      if (!node) return false;
+      const targetNode = node.nodeType === Node.TEXT_NODE ? node.parentNode : node;
+      return !!targetNode && (editor === targetNode || editor.contains(targetNode));
+    };
+    return containsNode(anchorNode) && containsNode(focusNode);
+  };
 
   const persistCachedUpload = (nextCached: CachedUpload | null) => {
     setCachedUpload(nextCached);
@@ -364,6 +441,7 @@ export default function Home() {
     setDraftFailedItems([]);
     setSelectedSheet("");
     setTemplateDirty(false);
+    setFontControlValue(selectedFont);
     setPreviewPage(1);
     setPreviewPageSize(previewPageSizeOptions[0]);
     persistCachedUpload(null);
@@ -475,6 +553,7 @@ export default function Home() {
         setCachedUpload(parsed);
         if (parsed.font) {
           setSelectedFont(parsed.font);
+          setFontControlValue(parsed.font);
         }
         if (parsed.selectedSheet) {
           setSelectedSheet(parsed.selectedSheet);
@@ -500,6 +579,10 @@ export default function Home() {
     };
     void loadPickerConfig();
   }, [gmailEmail]);
+
+  useEffect(() => {
+    setFontControlValue(selectedFont);
+  }, [selectedFont]);
 
   useEffect(() => {
     const hostname = window.location.hostname;
@@ -575,6 +658,22 @@ export default function Home() {
     return () => window.removeEventListener("keydown", onKey);
   }, [showGuide]);
 
+  useEffect(() => {
+    if (!showAttachmentPreview) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setShowAttachmentPreview(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showAttachmentPreview]);
+
+  useEffect(() => {
+    return () => {
+      attachmentObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      attachmentObjectUrlsRef.current = [];
+    };
+  }, []);
+
   // 精靈：處理完成後自動前進到「產生草稿」步驟
   useEffect(() => {
     if (!pendingAdvance) return;
@@ -638,21 +737,21 @@ export default function Home() {
     };
 
     appendItem("收件人", emailHeader);
-    appendItem("副本", ccHeader);
-    appendItem("密件副本", bccHeader);
     appendItem("主旨", subjectHeader);
-
-    for (const header of preview.detected_fields?.attachments ?? []) {
-      items.push({
-        label: header.startsWith("附件") ? header : "附件",
-        header,
-        value: firstRow[header] ?? "",
-        tone: "attachment",
-      });
-    }
+    const attachmentHeaders = preview.detected_fields?.attachments ?? [];
+    const attachmentCount = attachmentHeaders.reduce(
+      (count, header) => count + splitAttachmentCell(firstRow[header]).length,
+      0
+    );
+    items.push({
+      label: "附件",
+      header: `${attachmentCount} 份`,
+      value: attachmentCount > 0 ? "已指定附件" : "未指定附件",
+      tone: "attachment",
+    });
 
     return items;
-  }, [preview, emailHeader, ccHeader, bccHeader, subjectHeader]);
+  }, [preview, emailHeader, subjectHeader]);
 
   const previewRowItems = useMemo(() => {
     if (!preview?.headers || !preview.first_row) return [];
@@ -680,6 +779,85 @@ export default function Home() {
 
   const previewTableRows = preview?.preview_rows ?? [];
   const previewPagination = preview?.preview_pagination;
+  const activeAttachmentPreview = attachmentPreviewItems[attachmentPreviewIndex] ?? null;
+
+  const openAttachmentPreview = (items: AttachmentPreviewEntry[], index = 0) => {
+    attachmentObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    attachmentObjectUrlsRef.current = items
+      .map((item) => item.inlineUrl)
+      .filter((url) => url.startsWith("blob:"));
+    setAttachmentPreviewItems(items);
+    setAttachmentPreviewIndex(Math.max(0, Math.min(index, items.length - 1)));
+    setShowAttachmentPreview(items.length > 0);
+  };
+
+  const buildDriveAttachmentPreviewEntry = (file: DriveFile): AttachmentPreviewEntry => {
+    const baseUrl = new URL(`${apiBase}/api/drive/file-content`, window.location.origin);
+    baseUrl.searchParams.set("file_id", file.id);
+    baseUrl.searchParams.set("kind", "attachment");
+    const downloadUrl = new URL(baseUrl.toString());
+    downloadUrl.searchParams.set("download", "1");
+    return {
+      id: `drive-${file.id}`,
+      name: file.name,
+      mimeType: file.mime_type,
+      sourceLabel: "Google 雲端硬碟",
+      previewable: isPreviewableAttachmentMime(file.mime_type),
+      inlineUrl: baseUrl.toString(),
+      downloadUrl: downloadUrl.toString(),
+    };
+  };
+
+  const buildLocalAttachmentPreviewEntries = (files: File[]): AttachmentPreviewEntry[] =>
+    files.map((file, index) => {
+      const objectUrl = URL.createObjectURL(file);
+      return {
+        id: `local-${file.name}-${index}`,
+        name: file.name,
+        mimeType: file.type || "application/octet-stream",
+        sourceLabel: "本機上傳",
+        previewable: isPreviewableAttachmentMime(file.type || ""),
+        inlineUrl: objectUrl,
+        downloadUrl: objectUrl,
+      };
+    });
+
+  const buildResolvedAttachmentPreviewEntries = (items: AttachmentPreviewItem[]): AttachmentPreviewEntry[] => {
+    if (!cachedUpload?.cacheId) return [];
+    return items.map((item) => {
+      const baseUrl = new URL(`${apiBase}/api/attachments/content`, window.location.origin);
+      baseUrl.searchParams.set("cache_id", cachedUpload.cacheId);
+      baseUrl.searchParams.set("row", String(item.row_index));
+      baseUrl.searchParams.set("attachment_index", String(item.attachment_index));
+      if (selectedSheet) {
+        baseUrl.searchParams.set("sheet", selectedSheet);
+      }
+      const downloadUrl = new URL(baseUrl.toString());
+      downloadUrl.searchParams.set("download", "1");
+      return {
+        id: `resolved-${item.row_index}-${item.attachment_index}`,
+        name: item.name,
+        mimeType: item.mime_type,
+        sourceLabel:
+          item.source === "local_upload"
+            ? "本機上傳"
+            : item.source === "local_folder"
+            ? "本機資料夾"
+            : item.source === "drive_selected"
+            ? "雲端挑選"
+            : item.source === "drive_folder"
+            ? "雲端資料夾"
+            : "Drive fallback",
+        previewable: item.previewable,
+        inlineUrl: baseUrl.toString(),
+        downloadUrl: downloadUrl.toString(),
+      };
+    });
+  };
+  const resolvedAttachmentPreviewEntries = useMemo(
+    () => buildResolvedAttachmentPreviewEntries(preview?.first_row_attachments ?? []),
+    [preview?.first_row_attachments, cachedUpload?.cacheId, selectedSheet]
+  );
 
   const loadDriveFiles = async (kind: DriveKind, query = driveQuery) => {
     setDriveLoading(true);
@@ -991,11 +1169,15 @@ export default function Home() {
     if (templateDirty || !hasDocxSource) {
       formData.append("template_html", templateHtml);
     }
+    appendAttachmentSources(formData);
 
     const url = new URL(`${apiBase}/api/process`, window.location.origin);
     url.searchParams.set("font", selectedFont);
     url.searchParams.set("preview_page", "1");
     url.searchParams.set("preview_page_size", String(previewPageSize));
+    if (attachmentsDir.trim()) {
+      url.searchParams.set("attachments_dir", attachmentsDir.trim());
+    }
     if (selectedSheet) {
       url.searchParams.set("sheet", selectedSheet);
     }
@@ -1059,6 +1241,11 @@ export default function Home() {
     setDriveFiles([]);
     setDriveQuery("");
     setDriveError(null);
+    setShowAttachmentPreview(false);
+    setAttachmentPreviewItems([]);
+    setAttachmentPreviewIndex(0);
+    attachmentObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    attachmentObjectUrlsRef.current = [];
     if (localAttachmentFolderInputRef.current) localAttachmentFolderInputRef.current.value = "";
     if (cloudAttachmentInputRef.current) cloudAttachmentInputRef.current.value = "";
     if (docxInputRef.current) docxInputRef.current.value = "";
@@ -1104,6 +1291,7 @@ export default function Home() {
           formData.append("docx_drive_file_id", driveDocx.id);
         }
         formData.append("template_html", templateHtml);
+        appendAttachmentSources(formData);
         const url = new URL(`${apiBase}/api/process`, window.location.origin);
         url.searchParams.set("font", selectedFont);
         if (nextSheet) {
@@ -1111,6 +1299,9 @@ export default function Home() {
         }
         url.searchParams.set("preview_page", "1");
         url.searchParams.set("preview_page_size", String(previewPageSize));
+        if (attachmentsDir.trim()) {
+          url.searchParams.set("attachments_dir", attachmentsDir.trim());
+        }
         response = await fetch(url.toString(), {
           method: "POST",
           credentials: "include",
@@ -1166,12 +1357,16 @@ export default function Home() {
           formData.append("docx_drive_file_id", driveDocx.id);
         }
         formData.append("template_html", templateHtml);
+        appendAttachmentSources(formData);
         const url = new URL(`${apiBase}/api/process`, window.location.origin);
         url.searchParams.set("font", selectedFont);
         url.searchParams.set("preview_page", String(nextPage));
         url.searchParams.set("preview_page_size", String(nextPageSize));
         if (selectedSheet) {
           url.searchParams.set("sheet", selectedSheet);
+        }
+        if (attachmentsDir.trim()) {
+          url.searchParams.set("attachments_dir", attachmentsDir.trim());
         }
         response = await fetch(url.toString(), {
           method: "POST",
@@ -1220,6 +1415,21 @@ export default function Home() {
     }
   };
 
+  const appendAttachmentSources = (formData: FormData) => {
+    if (selectedDriveAttachments.length > 0) {
+      formData.append(
+        "attachment_drive_file_ids_json",
+        JSON.stringify(selectedDriveAttachments.map((file) => file.id))
+      );
+    }
+    if (selectedDriveFolder) {
+      formData.append("attachment_drive_folder_id", selectedDriveFolder.id);
+    }
+    if (selectedLocalAttachmentFiles.length > 0) {
+      selectedLocalAttachmentFiles.forEach((file) => formData.append("attachment_local_files", file));
+    }
+  };
+
   const syncEditorHtml = () => {
     const plainHtml = stripTemplatePlaceholderMarkup(editorRef.current?.innerHTML || defaultTemplateHtml);
     const decoratedHtml = decorateTemplatePlaceholders(plainHtml);
@@ -1254,8 +1464,12 @@ export default function Home() {
   };
 
   const applyEditorFont = (font: string) => {
+    setFontControlValue(font);
+    if (hasExpandedEditorSelection()) {
+      runEditorValueCommand("fontName", font);
+      return;
+    }
     setSelectedFont(font);
-    runEditorValueCommand("fontName", font);
   };
 
   const createEditorLink = () => {
@@ -1323,6 +1537,7 @@ export default function Home() {
         body: JSON.stringify({
           template_html: templateHtml,
           filename: filenameBase,
+          font: selectedFont,
         }),
       });
       if (!response.ok) {
@@ -1521,13 +1736,9 @@ export default function Home() {
   return (
     <div className="page">
       <div className="bg-fx" aria-hidden="true">
-        <div className="bg-grid" />
-        <svg className="bg-lines" viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice">
-          <path d="M-60 120 C 320 40, 700 200, 1040 110 S 1520 -20, 1620 150" />
-          <path d="M-60 300 C 300 220, 720 420, 1080 300 S 1540 200, 1620 360" />
-          <path d="M-60 500 C 340 420, 700 620, 1060 500 S 1520 400, 1620 560" />
-          <path d="M-60 700 C 320 620, 740 820, 1100 700 S 1540 620, 1620 780" />
-        </svg>
+        <div className="bg-blobs" />
+        {/* Sidereal Order 觀測圖紋理背景（手機用直式、桌機用橫式，見 globals.css） */}
+        <div className="bg-plate" />
       </div>
 
       <input
@@ -1831,6 +2042,9 @@ export default function Home() {
                       不上傳模板也能直接編輯；後續預覽、Gmail 草稿與 DOCX 匯出都會使用這份內容。
                     </p>
                     <p className="field-hint">
+                      未選取文字時，字型會更新全域 fallback；選取文字後再切換字型，只會套用到選取內容。若模板內容本身已指定字型，仍以內容設定為準。
+                    </p>
+                    <p className="field-hint">
                       在 editor 內，<span className="editor-placeholder-inline">{"{{欄位}}"}</span> 會自動標示成 XLSX 對照欄位。
                     </p>
                     {hasDocxSource && (
@@ -1855,7 +2069,7 @@ export default function Home() {
                       <span className="editor-select-label">字型</span>
                       <select
                         className="editor-font-select"
-                        value={selectedFont}
+                        value={fontControlValue}
                         onChange={(event) => applyEditorFont(event.target.value)}
                       >
                         {fontOptions.map((option) => (
@@ -1972,6 +2186,7 @@ export default function Home() {
                 <div
                   ref={editorRef}
                   className="template-editor"
+                  style={{ fontFamily: resolveFontFallbackStack(selectedFont) }}
                   contentEditable
                   suppressContentEditableWarning
                   onInput={(event) => {
@@ -2045,29 +2260,11 @@ export default function Home() {
               <div className="step-head">
                 <div>
                   <h2 className="step-title">合併設定</h2>
-                  <p className="step-desc">選擇字型與附件來源，套用到每一封草稿。</p>
+                  <p className="step-desc">設定附件來源與收件資料，套用到每一封草稿。</p>
                 </div>
               </div>
 
               <div className="settings-grid">
-                <div className="field">
-                  <label className="field-label" htmlFor="font-select">
-                    字型（Gmail 支援）
-                  </label>
-                  <select
-                    id="font-select"
-                    className="select"
-                    value={selectedFont}
-                    onChange={(event) => setSelectedFont(event.target.value)}
-                  >
-                    {fontOptions.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
                 {preview?.sheet_names && preview.sheet_names.length > 0 && (
                   <div className="field">
                     <label className="field-label" htmlFor="sheet-select">
@@ -2113,7 +2310,7 @@ export default function Home() {
                     )}
                   </div>
                   <span className="field-hint">
-                    Excel 的「附件1／附件2」填檔名；系統會優先比對你手動挑選的 Drive
+                    Excel 使用單一「附件」欄；同一格可用換行、逗號、頓號或分號指定多個檔名。系統會優先比對你手動挑選的 Drive
                     附件、這次瀏覽的本機資料夾，再找本機資料夾路徑、指定的 Drive 資料夾，最後才做 Drive fallback。
                   </span>
                   {isHostedFrontend === true && (
@@ -2125,6 +2322,13 @@ export default function Home() {
                         <span className="attachment-icon" aria-hidden="true">附</span>
                         <span className="attachment-name">本機檔案 {selectedLocalAttachmentFiles.length} 份</span>
                         <span className="attachment-meta">已載入</span>
+                        <button
+                          className="attachment-action"
+                          type="button"
+                          onClick={() => openAttachmentPreview(buildLocalAttachmentPreviewEntries(selectedLocalAttachmentFiles))}
+                        >
+                          預覽
+                        </button>
                         <button className="attachment-remove" onClick={clearSelectedLocalAttachmentFiles}>
                           清除
                         </button>
@@ -2196,6 +2400,13 @@ export default function Home() {
                               <span className="attachment-icon" aria-hidden="true">附</span>
                               <span className="attachment-name">{file.name}</span>
                               <span className="attachment-meta">已上傳</span>
+                              <button
+                                className="attachment-action"
+                                type="button"
+                                onClick={() => openAttachmentPreview([buildDriveAttachmentPreviewEntry(file)])}
+                              >
+                                預覽
+                              </button>
                             </div>
                           ))}
                         </div>
@@ -2221,6 +2432,13 @@ export default function Home() {
                           <span className="attachment-icon" aria-hidden="true">附</span>
                           <span className="attachment-name">{file.name}</span>
                           <span className="attachment-meta">Drive</span>
+                          <button
+                            className="attachment-action"
+                            type="button"
+                            onClick={() => openAttachmentPreview([buildDriveAttachmentPreviewEntry(file)])}
+                          >
+                            預覽
+                          </button>
                           <button
                             className="attachment-remove"
                             onClick={() => removeSelectedDriveAttachment(file.id)}
@@ -2465,57 +2683,27 @@ export default function Home() {
                     <span className="xlsx-preview-count">第 1 / {preview.total_records} 筆</span>
                   </div>
 
-                  {previewRowItems.length > 0 ? (
-                    <>
-                      {previewSummaryItems.length > 0 && (
-                        <div className="xlsx-preview-summary">
-                          {previewSummaryItems.map((item) => (
-                            <div
-                              key={`${item.label}-${item.header ?? "na"}`}
-                              className={`xlsx-preview-card tone-${item.tone}`}
-                            >
-                              <span className="xlsx-preview-card-title">
-                                <span>{item.label}</span>
-                                <span>{item.header}</span>
-                              </span>
-                              <span
-                                className={`xlsx-preview-card-value${
-                                  item.value ? "" : " is-empty"
-                                }`}
-                              >
-                                {item.value || "空白"}
-                              </span>
-                            </div>
-                          ))}
+                  {previewSummaryItems.length > 0 ? (
+                    <div className="xlsx-preview-summary">
+                      {previewSummaryItems.map((item) => (
+                        <div
+                          key={`${item.label}-${item.header ?? "na"}`}
+                          className={`xlsx-preview-card tone-${item.tone}`}
+                        >
+                          <span className="xlsx-preview-card-title">
+                            <span>{item.label}</span>
+                            <span>{item.header}</span>
+                          </span>
+                          <span
+                            className={`xlsx-preview-card-value${
+                              item.value ? "" : " is-empty"
+                            }`}
+                          >
+                            {item.value || "空白"}
+                          </span>
                         </div>
-                      )}
-
-                      <div className="xlsx-field-list">
-                        {previewRowItems.map((item) => (
-                          <div key={item.header} className="xlsx-preview-item">
-                            <div className="xlsx-preview-item-head">
-                              <span className="xlsx-preview-item-label">{item.header}</span>
-                              {item.tags.length > 0 && (
-                                <span className="xlsx-preview-badges">
-                                  {item.tags.map((tag) => (
-                                    <span key={`${item.header}-${tag}`} className="xlsx-preview-badge">
-                                      {tag}
-                                    </span>
-                                  ))}
-                                </span>
-                              )}
-                            </div>
-                            <div
-                              className={`xlsx-preview-item-value${
-                                item.value ? "" : " is-empty"
-                              }`}
-                            >
-                              {item.value || "空白"}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </>
+                      ))}
+                    </div>
                   ) : (
                     <p className="field-hint">目前工作表沒有可預覽的資料列。</p>
                   )}
@@ -2538,6 +2726,35 @@ export default function Home() {
                   </div>
                 )}
               </div>
+
+              {preview && (
+                <div className="resolved-attachments-panel">
+                  <div className="resolved-attachments-head">
+                    <span className="resolved-attachments-title">本列附件</span>
+                    <span className="resolved-attachments-count">{resolvedAttachmentPreviewEntries.length} 份</span>
+                  </div>
+                  {resolvedAttachmentPreviewEntries.length > 0 ? (
+                    <div className="attachment-tray" aria-label="首筆附件預覽">
+                      {resolvedAttachmentPreviewEntries.map((item, index) => (
+                        <div key={item.id} className="attachment-pill">
+                          <span className="attachment-icon" aria-hidden="true">附</span>
+                          <span className="attachment-name">{item.name}</span>
+                          <span className="attachment-meta">{item.sourceLabel}</span>
+                          <button
+                            className="attachment-action"
+                            type="button"
+                            onClick={() => openAttachmentPreview(resolvedAttachmentPreviewEntries, index)}
+                          >
+                            預覽
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="field-hint">這一列目前沒有可帶入的附件。</p>
+                  )}
+                </div>
+              )}
 
               {preview && (
                 <div className="xlsx-table-panel">
@@ -2694,6 +2911,82 @@ export default function Home() {
         </div>
       </main>
 
+      {showAttachmentPreview && activeAttachmentPreview && (
+        <div
+          className="guide-overlay"
+          onClick={() => setShowAttachmentPreview(false)}
+          role="dialog"
+          aria-modal="true"
+          aria-label="附件預覽"
+        >
+          <div className="attachment-preview-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="guide-modal-head">
+              <div>
+                <p className="guide-modal-title">附件預覽</p>
+                <p className="guide-modal-sub">
+                  {activeAttachmentPreview.sourceLabel} · {attachmentPreviewIndex + 1} / {attachmentPreviewItems.length}
+                </p>
+              </div>
+              <button className="guide-close" onClick={() => setShowAttachmentPreview(false)} aria-label="關閉">
+                ✕
+              </button>
+            </div>
+            <div className="attachment-preview-layout">
+              <div className="attachment-preview-list" aria-label="附件清單">
+                {attachmentPreviewItems.map((item, index) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={`attachment-preview-item ${index === attachmentPreviewIndex ? "active" : ""}`}
+                    onClick={() => setAttachmentPreviewIndex(index)}
+                  >
+                    <span className="attachment-preview-item-name">{item.name}</span>
+                    <span className="attachment-preview-item-meta">{item.sourceLabel}</span>
+                  </button>
+                ))}
+              </div>
+              <div className="attachment-preview-stage">
+                <div className="attachment-preview-toolbar">
+                  <div>
+                    <p className="attachment-preview-name">{activeAttachmentPreview.name}</p>
+                    <p className="attachment-preview-mime">{activeAttachmentPreview.mimeType || "application/octet-stream"}</p>
+                  </div>
+                  <a
+                    className="btn btn-outline btn-sm"
+                    href={activeAttachmentPreview.downloadUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    下載附件
+                  </a>
+                </div>
+                {activeAttachmentPreview.previewable ? (
+                  activeAttachmentPreview.mimeType.startsWith("image/") ? (
+                    <img
+                      className="attachment-preview-image"
+                      src={activeAttachmentPreview.inlineUrl}
+                      alt={activeAttachmentPreview.name}
+                    />
+                  ) : (
+                    <iframe
+                      className="attachment-preview-frame"
+                      src={activeAttachmentPreview.inlineUrl}
+                      title={activeAttachmentPreview.name}
+                    />
+                  )
+                ) : (
+                  <div className="attachment-preview-empty">
+                    <span className="preview-empty-mark" aria-hidden="true">附</span>
+                    <p>這個檔案類型目前不做內嵌預覽</p>
+                    <span>可直接下載，或在雲端來源中開啟原檔確認內容。</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showGuide && (
         <div
           className="guide-overlay"
@@ -2708,7 +3001,7 @@ export default function Home() {
                 <p className="guide-modal-title">運作原理</p>
                 <p className="guide-modal-sub">
                   Excel 的姓名 / 職稱 / 公司等欄位會代入 Word 模板的 <code>{"{{代換欄位}}"}</code>；收件人與主旨直接來自
-                  Excel 欄位，一列資料生成一封草稿；附件依 <code>附件1/附件2…</code> 欄逐列指派。
+                  Excel 欄位，一列資料生成一封草稿；附件依單一 <code>附件</code> 欄逐列指派。
                 </p>
               </div>
               <button className="guide-close" onClick={() => setShowGuide(false)} aria-label="關閉">

@@ -6,6 +6,7 @@ from html.parser import HTMLParser
 
 from docx import Document
 from docx.shared import RGBColor
+from docx.oxml.ns import qn
 
 GMAIL_FONT_STACKS = {
     "Sans Serif": "Arial, Helvetica, sans-serif",
@@ -43,6 +44,11 @@ def create_default_template_html(base_font_family: str | None = None) -> str:
     )
 
 
+def apply_global_font_fallback(html: str, base_font_family: str | None = None) -> str:
+    font_family = base_font_family or resolve_gmail_font(None)
+    return f"<div style=\"font-family: {font_family};\">{html}</div>"
+
+
 def resolve_template_html(
     *,
     docx_content: bytes | None = None,
@@ -50,7 +56,7 @@ def resolve_template_html(
     base_font_family: str | None = None,
 ) -> str:
     if template_html and template_html.strip():
-        return template_html
+        return apply_global_font_fallback(template_html, base_font_family=base_font_family)
     if docx_content is not None:
         return convert_docx_to_html(docx_content, base_font_family=base_font_family)
     return create_default_template_html(base_font_family=base_font_family)
@@ -306,6 +312,18 @@ class _DocxHtmlParser(HTMLParser):
             color_match = re.search(r"color\s*:\s*#?([0-9a-fA-F]{6})", style_attr)
             if color_match:
                 next_style["color"] = color_match.group(1)
+            font_match = re.search(r"font-family\s*:\s*([^;]+)", style_attr)
+            if font_match:
+                next_style["font_family"] = font_match.group(1).strip()
+        elif tag == "font":
+            face = attrs_dict.get("face")
+            if face:
+                next_style["font_family"] = face.strip()
+            color = attrs_dict.get("color")
+            if isinstance(color, str):
+                normalized_color = color.strip().lstrip("#")
+                if re.fullmatch(r"[0-9a-fA-F]{6}", normalized_color):
+                    next_style["color"] = normalized_color
 
         if tag in {"p", "div", "li"}:
             self._push_paragraph()
@@ -354,6 +372,18 @@ def export_html_to_docx_bytes(html: str) -> bytes:
                     color = style.get("color")
                     if isinstance(color, str) and re.fullmatch(r"[0-9a-fA-F]{6}", color):
                         run.font.color.rgb = RGBColor.from_string(color.upper())
+                    font_family = style.get("font_family")
+                    if isinstance(font_family, str) and font_family.strip():
+                        primary_font = font_family.split(",")[0].strip().strip("'\"")
+                        if primary_font:
+                            run.font.name = primary_font
+                            if run._element.rPr is None:
+                                run._element.get_or_add_rPr()
+                            rfonts = run._element.rPr.get_or_add_rFonts()
+                            rfonts.set(qn("w:ascii"), primary_font)
+                            rfonts.set(qn("w:hAnsi"), primary_font)
+                            rfonts.set(qn("w:eastAsia"), primary_font)
+                            rfonts.set(qn("w:cs"), primary_font)
 
     if not document.paragraphs:
         document.add_paragraph("")

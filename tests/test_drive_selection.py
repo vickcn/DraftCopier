@@ -6,8 +6,17 @@ from pathlib import Path
 
 import pandas as pd
 from fastapi.testclient import TestClient
+from docx import Document
 
-from api.index import _build_preview_payload, app, session_info
+from api.index import (
+    _build_preview_payload,
+    _find_attachment_headers,
+    _resolve_row_attachments,
+    _split_attachment_names,
+    app,
+    session_info,
+)
+from api.core.processor import export_html_to_docx_bytes
 
 
 def make_xlsx_bytes(sheets: dict[str, list[dict[str, object]]]) -> bytes:
@@ -19,6 +28,36 @@ def make_xlsx_bytes(sheets: dict[str, list[dict[str, object]]]) -> bytes:
 
 
 class BuildPreviewPayloadTests(unittest.TestCase):
+    def test_attachment_detection_uses_single_attachment_column(self):
+        self.assertEqual(_find_attachment_headers(["email", "附件", "附件1", "附件2"]), ["附件"])
+
+    def test_split_attachment_names_accepts_common_cell_separators(self):
+        self.assertEqual(
+            _split_attachment_names("簡章.pdf、報名表.pdf\n地圖.pdf, 合約.pdf；說明.pdf"),
+            ["簡章.pdf", "報名表.pdf", "地圖.pdf", "合約.pdf", "說明.pdf"],
+        )
+
+    def test_resolve_row_attachments_uses_multiple_names_from_single_cell(self):
+        selected_local = {
+            "簡章.pdf": {"filename": "簡章.pdf", "content": b"intro", "mime_type": "application/pdf"},
+            "報名表.pdf": {"filename": "報名表.pdf", "content": b"form", "mime_type": "application/pdf"},
+        }
+
+        attachments, errors = _resolve_row_attachments(
+            row={"附件": "簡章.pdf、報名表.pdf"},
+            row_index=1,
+            attachment_headers_raw=["附件"],
+            selected_drive_attachments={},
+            selected_local_attachments=selected_local,
+            base_dir=Path("/path/not/exist"),
+            creds=None,
+            drive_service=None,
+            attachment_drive_folder_id=None,
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual([item["filename"] for item in attachments], ["簡章.pdf", "報名表.pdf"])
+
     @patch("api.index.inject_variables", side_effect=lambda template, row: template.replace("{{name}}", str(row["name"])))
     @patch("api.index.resolve_template_html", return_value="<p>{{name}}</p>")
     def test_build_preview_payload_exposes_sheet_names_and_default_selection(self, _resolve_template_html, _inject_variables):
@@ -87,8 +126,14 @@ class BuildPreviewPayloadTests(unittest.TestCase):
             preview_page_size=20,
         )
 
-        self.assertEqual(payload["template_html"], "<p>{{name}}</p>")
-        self.assertEqual(payload["preview_first_row"], "<p>Alice</p>")
+        self.assertEqual(
+            payload["template_html"],
+            '<div style="font-family: Arial, Helvetica, sans-serif;"><p>{{name}}</p></div>',
+        )
+        self.assertEqual(
+            payload["preview_first_row"],
+            '<div style="font-family: Arial, Helvetica, sans-serif;"><p>Alice</p></div>',
+        )
 
     @patch("api.index.inject_variables", side_effect=lambda template, row: template.replace("{{name}}", str(row["name"])))
     @patch("api.index.resolve_template_html", return_value="<p>{{name}}</p>")
@@ -119,6 +164,72 @@ class BuildPreviewPayloadTests(unittest.TestCase):
         self.assertEqual(len(payload["preview_rows"]), 20)
         self.assertEqual(payload["preview_rows"][0]["name"], "User 20")
         self.assertEqual(payload["preview_rows"][19]["subject"], "Subject 39")
+
+    @patch("api.index._resolve_row_attachments")
+    @patch("api.index.inject_variables", side_effect=lambda template, row: template.replace("{{name}}", str(row["name"])))
+    @patch("api.index.resolve_template_html", return_value="<p>{{name}}</p>")
+    def test_build_preview_payload_exposes_first_row_attachments(
+        self,
+        _resolve_template_html,
+        _inject_variables,
+        mock_resolve_row_attachments,
+    ):
+        xlsx_content = make_xlsx_bytes(
+            {
+                "名單": [
+                    {"name": "Alice", "email": "alice@example.com", "subject": "Hello", "附件": "簡章.pdf"},
+                ],
+            }
+        )
+        mock_resolve_row_attachments.return_value = (
+            [
+                {
+                    "filename": "簡章.pdf",
+                    "mime_type": "application/pdf",
+                    "source": "local_upload",
+                    "content": b"pdf-bytes",
+                }
+            ],
+            [],
+        )
+
+        payload = _build_preview_payload(
+            docx_content=None,
+            template_html="<p>{{name}}</p>",
+            xlsx_content=xlsx_content,
+            sheet=None,
+            font=None,
+            cache_info={"cache_id": "a" * 32, "docx_name": "編輯器內容", "xlsx_name": "名單.xlsx"},
+            preview_page=1,
+            preview_page_size=20,
+            attachment_context={
+                "selected_drive_attachments": {},
+                "selected_local_attachments": {},
+                "attachments_dir": None,
+                "attachment_drive_folder_id": None,
+                "creds": None,
+                "drive_service": None,
+            },
+        )
+
+        self.assertEqual(
+            payload["first_row_attachments"],
+            [
+                {
+                    "name": "簡章.pdf",
+                    "mime_type": "application/pdf",
+                    "source": "local_upload",
+                    "previewable": True,
+                    "attachment_index": 0,
+                    "row_index": 0,
+                }
+            ],
+        )
+
+    def test_export_html_to_docx_preserves_font_face_from_font_tag(self):
+        content = export_html_to_docx_bytes('<p><font face="Garamond">Hello</font></p>')
+        document = Document(io.BytesIO(content))
+        self.assertEqual(document.paragraphs[0].runs[0].font.name, "Garamond")
 
 
 class DriveFilesEndpointTests(unittest.TestCase):
@@ -338,7 +449,7 @@ class BatchDraftAttachmentSelectionTests(unittest.TestCase):
                     {
                         "email": "alice@example.com",
                         "subject": "Hello",
-                        "附件1": "簡章.pdf",
+                        "附件": "簡章.pdf",
                     }
                 ]
             }
@@ -448,7 +559,7 @@ class BatchDraftAttachmentSelectionTests(unittest.TestCase):
                     {
                         "email": "alice@example.com",
                         "subject": "Hello",
-                        "附件1": "簡章.pdf",
+                        "附件": "簡章.pdf",
                     }
                 ]
             }
@@ -483,6 +594,59 @@ class BatchDraftAttachmentSelectionTests(unittest.TestCase):
         mock_get_attachment_content.assert_called_once()
         self.assertEqual(mock_get_attachment_content.call_args.kwargs["parent_folder_id"], "folder-123")
 
+
+class AttachmentPreviewEndpointTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+        self.client.post("/api/dev/login")
+
+    @patch("api.index.inject_variables", side_effect=lambda template, row: template.replace("{{name}}", str(row["name"])))
+    def test_attachment_preview_reads_cached_local_attachment(self, _inject_variables):
+        xlsx_content = make_xlsx_bytes(
+            {
+                "名單": [
+                    {"name": "Alice", "email": "alice@example.com", "subject": "Hello", "附件": "簡章.pdf"},
+                ]
+            }
+        )
+
+        response = self.client.post(
+            "/api/process",
+            params={"font": "Sans Serif"},
+            data={"template_html": "<p>{{name}}</p>"},
+            files=[
+                (
+                    "xlsx_file",
+                    (
+                        "list.xlsx",
+                        xlsx_content,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    ),
+                ),
+                (
+                    "attachment_local_files",
+                    ("簡章.pdf", b"pdf-bytes", "application/pdf"),
+                ),
+            ],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["first_row_attachments"][0]["name"], "簡章.pdf")
+
+        preview_response = self.client.get(
+            "/api/attachments/content",
+            params={
+                "cache_id": payload["cache_id"],
+                "row": 0,
+                "attachment_index": 0,
+            },
+        )
+
+        self.assertEqual(preview_response.status_code, 200)
+        self.assertEqual(preview_response.content, b"pdf-bytes")
+        self.assertEqual(preview_response.headers["content-type"], "application/pdf")
+
     @patch("api.index.create_draft", return_value={"id": "draft-1"})
     @patch("api.index.resolve_template_html", return_value="<p>Hello</p>")
     @patch("api.index.load_user_credentials", return_value=object())
@@ -500,7 +664,7 @@ class BatchDraftAttachmentSelectionTests(unittest.TestCase):
                     {
                         "email": "alice@example.com",
                         "subject": "Hello",
-                        "附件1": "簡章.pdf",
+                        "附件": "簡章.pdf",
                     }
                 ]
             }

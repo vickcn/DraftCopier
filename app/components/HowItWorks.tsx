@@ -20,11 +20,10 @@ const HEADERS: { label: string; map?: boolean; att?: boolean }[] = [
   { label: "姓名", map: true },
   { label: "職稱", map: true },
   { label: "公司", map: true },
-  { label: "附件1", att: true },
-  { label: "附件2", att: true },
+  { label: "附件", att: true },
 ];
 
-const GRID_COLS = "1.5fr 1.15fr .8fr .95fr .75fr .95fr .95fr";
+const GRID_COLS = "1.5fr 1.15fr .8fr .95fr .75fr 1.55fr";
 
 /**
  * 聯動原理引導動畫：Excel 欄位資料 → Word 模板代換欄位 + 草稿欄位 → 逐列指派附件 → 批次 Gmail 草稿。
@@ -507,10 +506,7 @@ export default function HowItWorks({ speed = 1, primary, accent }: Props) {
                     <div style={cellStyle(".27s")}>產品總監</div>
                     <div style={cellStyle(".36s")}>Acme</div>
                     <div style={{ ...cellStyle(".45s"), fontFamily: MONO, fontSize: 10.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                      簡章.pdf
-                    </div>
-                    <div style={{ ...cellStyle(".54s"), fontFamily: MONO, fontSize: 10.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                      報名表.pdf
+                      簡章.pdf、報名表.pdf
                     </div>
                   </div>
                 </div>
@@ -524,7 +520,6 @@ export default function HowItWorks({ speed = 1, primary, accent }: Props) {
                     <div style={plainCell}>行銷經理</div>
                     <div style={plainCell}>Nova</div>
                     <div style={{ ...monoCell, color: "#9aa4bd" }}>簡章.pdf</div>
-                    <div style={blankCell}>—</div>
                   </div>
                 </div>
 
@@ -536,7 +531,6 @@ export default function HowItWorks({ speed = 1, primary, accent }: Props) {
                     <div style={plainCell}>王建國</div>
                     <div style={plainCell}>執行長</div>
                     <div style={plainCell}>Peak</div>
-                    <div style={blankCell}>—</div>
                     <div style={blankCell}>—</div>
                   </div>
                 </div>
@@ -635,7 +629,7 @@ export default function HowItWorks({ speed = 1, primary, accent }: Props) {
                     </div>
                   </div>
 
-                  {/* 附件列：由 附件1/附件2 欄逐列指派 */}
+                  {/* 附件列：由單一附件欄逐列指派 */}
                   <div
                     data-attach
                     style={{
@@ -688,7 +682,7 @@ export default function HowItWorks({ speed = 1, primary, accent }: Props) {
                 borderRadius: 999,
               }}
             >
-              📎 附件依「附件1・附件2…」欄<b style={{ color: "var(--hiw-accent)", fontWeight: 600 }}>逐列指派</b>，留空即略過 —— 每封信附件數量可不同
+              附件依單一「附件」欄<b style={{ color: "var(--hiw-accent)", fontWeight: 600 }}>逐列指派</b>，同一格可用換行或逗號列多個檔名
             </span>
           </div>
 
